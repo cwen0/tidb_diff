@@ -1,84 +1,74 @@
-# 数据库表记录数一致性校验工具
+# 数据库表记录数一致性校验工具（扩展版）
 
-## 环境配置
+支持：
+- 逐表行数对比（可并发）
+- 库级表数量对比
+- 库级索引数量对比（TiDB 的 `INFORMATION_SCHEMA.TIDB_INDEXES`）
+- 库级视图数量对比
+- 可通过 `compare` 配置选择对比项
 
-### 1. 创建 Python 虚拟环境
+## 安装
 
 ```bash
+git clone https://github.com/asddongmen/tidb_diff.git
+cd tidb_diff
+
+# 可选：创建并激活虚拟环境
 python3 -m venv devenv
+source devenv/bin/activate   # Windows: devenv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
 ```
 
-### 2. 激活虚拟环境
+依赖：`pymysql`
 
-**macOS/Linux:**
-```bash
-source devenv/bin/activate
-```
+## 配置
 
-**Windows:**
-```bash
-devenv\Scripts\activate
-```
-
-### 3. 安装依赖
-
-```bash
-pip3 install pymysql
-```
-
-## 功能说明
-
-用于比对源数据库和目标数据库中同名表的记录数，支持批量校验多个数据库。
-
-## 使用方法
-
-编辑 `config.ini` 文件，配置所有参数：
+编辑 `config.ini`（示例）：
 
 ```ini
 [diff]
+src.instance = mysql://root@127.0.0.1:4000
+dst.instance = mysql://root@127.0.0.1:63844
+dbs = test%
+ignore_tables = tmp_log, sys_history
+threshold = 0
+output = diff_result.csv
 
-# 必填参数，指定源数据库连接串
-src.instance = mysql://user:pass@host:port
-dst.instance = mysql://user:pass@host:port
+# 对比内容：rows(逐表行数), tables(库级表数), indexes(库级索引数), views(库级视图数)
+# 留空或不填则默认全部启用
+compare = rows,tables,indexes,views
 
-# 可选参数，可指定源集群和目标集群的快照 TSO 进行对比
+# 并发线程数（仅 rows 对比使用，默认 1）
+concurrency = 4
+
+# 可选 snapshot_ts（TiDB）
 # src.snapshot_ts = 462796050923520000
 # dst.snapshot_ts = 462796051305201667
-
-# 必填参数，指定要对比的数据库列表， test% 表示对比 test 开头的所有数据库
-dbs = test%,db1,db2
-
-# 可选参数，指定忽略校验的表名，逗号分隔
-ignore_tables = tmp_log,sys_history
-# 
-# 可选参数，指定允许的记录数差异阈值（默认 0）
-threshold = 0
-
-# 可选参数，指定校验结果 CSV 文件路径（可选）
-output = diff_result.csv
 ```
 
-然后运行：
+## 使用
+
 ```bash
-python diff.py
+python diff.py                  # 使用默认 config.ini
+# 或指定配置并输出到日志
+python diff.py --config config.ini > diff.log 2>&1
 ```
 
-或指定配置文件路径：
-```bash
-python3 diff.py --config config.ini > diff.log 2>&1
-```
+## 输出
 
-## 配置说明
+- 控制台日志：
+  - 库级表/索引/视图数量对比结果（按 schema 展示差异）
+  - 逐表行数对比的过程信息
+- 若设置 `output`，生成 CSV：
+  - 列：`数据库, 表名, 源库条数, 目标库条数, 差额(绝对值), 结果`
+- 最终在控制台打印逐表行数对比的汇总。如果关闭 `rows` 对比，汇总会提示已跳过逐表行数对比。
 
-- `src.instance`: 源数据库连接串（格式：`mysql://user:pass@host:port`）
-- `dst.instance`: 目标数据库连接串（格式同上）
-- `dbs`: 数据库列表，支持通配符 `%`（如 `test%`）
-- `ignore_tables`: 忽略校验的表名，逗号分隔
-- `threshold`: 允许的记录数差异阈值（默认 0）
-- `output`: 校验结果 CSV 文件路径（可选）
-- `src.snapshot_ts` / `dst.snapshot_ts`: TiDB 快照时间戳（可选）
+## 对比项说明
 
-## 输出结果
-
-校验结果会输出到控制台，如配置了 `output` 参数，会同时导出为 CSV 文件。
-
+- `rows`：逐表行数对比（支持并发）
+- `tables`：库级表数量对比
+- `indexes`：库级索引数量对比（TiDB）
+- `views`：库级视图数量对比
+- 使用 `compare` 指定需要的子集，逗号分隔；留空默认全选。
