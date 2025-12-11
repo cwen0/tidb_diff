@@ -36,11 +36,25 @@ pip install -r requirements.txt
 
 ```ini
 [diff]
+
+# 必填参数，指定源数据库连接串
 src.instance = mysql://user:pass@host:port
 dst.instance = mysql://user:pass@host:port
+
+# 可选参数，可指定源集群和目标集群的快照 TSO 进行对比
+# src.snapshot_ts = 462796050923520000
+# dst.snapshot_ts = 462796051305201667
+
+# 必填参数，指定要对比的数据库列表， test% 表示对比 test 开头的所有数据库
 dbs = test%,db1,db2
+
+# 可选参数，指定忽略校验的表名，逗号分隔
 ignore_tables = tmp_log,sys_history
+# 
+# 可选参数，指定允许的记录数差异阈值（默认 0）
 threshold = 0
+
+# 可选参数，指定校验结果 CSV 文件路径（可选）
 output = diff_result.csv
 ```
 
