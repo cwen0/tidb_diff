@@ -1,6 +1,5 @@
 import sys
 import csv
-import json
 from math import ceil
 import configparser
 import logging
@@ -139,13 +138,25 @@ class DBDataDiff:
             src_ret, dst_ret = {}, {}
             with self._get_connection(src) as sc, self._get_connection(dst) as dc:
                 if src_snapshot_ts:
-                    cur = sc.cursor()
-                    cur.execute(f"SET @@tidb_snapshot={src_snapshot_ts}")
-                    cur.close()
+                    # Validate snapshot_ts is numeric to prevent SQL injection
+                    try:
+                        snapshot_val = int(src_snapshot_ts) if isinstance(src_snapshot_ts, str) else src_snapshot_ts
+                        cur = sc.cursor()
+                        cur.execute("SET @@tidb_snapshot=%s", (snapshot_val,))
+                        cur.close()
+                    except (ValueError, TypeError) as e:
+                        error(f"无效的 snapshot_ts 值: {src_snapshot_ts}, 错误: {str(e)}")
+                        raise
                 if dst_snapshot_ts:
-                    cur = dc.cursor()
-                    cur.execute(f"SET @@tidb_snapshot={dst_snapshot_ts}")
-                    cur.close()
+                    # Validate snapshot_ts is numeric to prevent SQL injection
+                    try:
+                        snapshot_val = int(dst_snapshot_ts) if isinstance(dst_snapshot_ts, str) else dst_snapshot_ts
+                        cur = dc.cursor()
+                        cur.execute("SET @@tidb_snapshot=%s", (snapshot_val,))
+                        cur.close()
+                    except (ValueError, TypeError) as e:
+                        error(f"无效的 snapshot_ts 值: {dst_snapshot_ts}, 错误: {str(e)}")
+                        raise
 
                 sc_tables_cursor = sc.cursor()
                 sc_tables_cursor.execute(
@@ -185,37 +196,42 @@ class DBDataDiff:
                 batch = 0
                 sc.autocommit(False)
                 dc.autocommit(False)
-                for _ in range(ceil(len(st) / batch_size)):
-                    start = batch * batch_size
-                    end = (batch + 1) * batch_size if (batch + 1) * batch_size <= len(st) else len(st)
-                    current_st = st[start:end]
-                    current_dt = dt[start:end]
+                try:
+                    for _ in range(ceil(len(st) / batch_size)):
+                        start = batch * batch_size
+                        end = (batch + 1) * batch_size if (batch + 1) * batch_size <= len(st) else len(st)
+                        current_st = st[start:end]
+                        current_dt = dt[start:end]
 
-                    src_sql = " union all ".join([
-                        f"select count(1) as cnt, '{t}' as table_name from `{db}`.`{t}`"
-                        for t in current_st
-                    ])
-                    dst_sql = " union all ".join([
-                        f"select count(1) as cnt, '{t}' as table_name from `{db}`.`{t}`"
-                        for t in current_dt
-                    ])
+                        src_sql = " union all ".join([
+                            f"select count(1) as cnt, '{t}' as table_name from `{db}`.`{t}`"
+                            for t in current_st
+                        ])
+                        dst_sql = " union all ".join([
+                            f"select count(1) as cnt, '{t}' as table_name from `{db}`.`{t}`"
+                            for t in current_dt
+                        ])
 
-                    sc_cursor = sc.cursor()
-                    sc_cursor.execute(src_sql)
-                    for cnts in sc_cursor.fetchall():
-                        src_ret[cnts["table_name"]] = cnts["cnt"]
-                    sc_cursor.close()
+                        sc_cursor = sc.cursor()
+                        sc_cursor.execute(src_sql)
+                        for cnts in sc_cursor.fetchall():
+                            src_ret[cnts["table_name"]] = cnts["cnt"]
+                        sc_cursor.close()
 
-                    dc_cursor = dc.cursor()
-                    dc_cursor.execute(dst_sql)
-                    for cntd in dc_cursor.fetchall():
-                        dst_ret[cntd["table_name"]] = cntd["cnt"]
-                    dc_cursor.close()
+                        dc_cursor = dc.cursor()
+                        dc_cursor.execute(dst_sql)
+                        for cntd in dc_cursor.fetchall():
+                            dst_ret[cntd["table_name"]] = cntd["cnt"]
+                        dc_cursor.close()
 
-                    batch += 1
+                        batch += 1
 
-                sc.commit()
-                dc.commit()
+                    sc.commit()
+                    dc.commit()
+                except Exception as e:
+                    sc.rollback()
+                    dc.rollback()
+                    raise
 
                 for r in src_ret.keys():
                     if r not in dst_ret.keys():
@@ -281,11 +297,7 @@ class DBDataDiff:
         if "output" in conf[action].keys():
             output = conf[action].get("output", "").strip()
 
-        out = None
-        if output:
-            out = open(output, 'w', newline='', encoding='utf-8')
-            wr = csv.writer(out)
-            wr.writerow(["数据库", "表名", "源库条数", "目标库条数", "差额(绝对值)", "结果"])
+        wr = None
 
         if "src.instance" in conf[action].keys() and "dst.instance" in conf[action].keys():
             src = conf[action].get("src.instance", "").strip()
@@ -329,13 +341,25 @@ class DBDataDiff:
             try:
                 with self._get_connection(src) as sc, self._get_connection(dst) as dc:
                     if src_snapshot_ts:
-                        cur = sc.cursor()
-                        cur.execute(f"SET @@tidb_snapshot={src_snapshot_ts}")
-                        cur.close()
+                        # Validate snapshot_ts is numeric to prevent SQL injection
+                        try:
+                            snapshot_val = int(src_snapshot_ts) if isinstance(src_snapshot_ts, str) else src_snapshot_ts
+                            cur = sc.cursor()
+                            cur.execute("SET @@tidb_snapshot=%s", (snapshot_val,))
+                            cur.close()
+                        except (ValueError, TypeError) as e:
+                            error(f"无效的 snapshot_ts 值: {src_snapshot_ts}, 错误: {str(e)}")
+                            raise
                     if dst_snapshot_ts:
-                        cur = dc.cursor()
-                        cur.execute(f"SET @@tidb_snapshot={dst_snapshot_ts}")
-                        cur.close()
+                        # Validate snapshot_ts is numeric to prevent SQL injection
+                        try:
+                            snapshot_val = int(dst_snapshot_ts) if isinstance(dst_snapshot_ts, str) else dst_snapshot_ts
+                            cur = dc.cursor()
+                            cur.execute("SET @@tidb_snapshot=%s", (snapshot_val,))
+                            cur.close()
+                        except (ValueError, TypeError) as e:
+                            error(f"无效的 snapshot_ts 值: {dst_snapshot_ts}, 错误: {str(e)}")
+                            raise
 
                     src_counts = self._get_schema_object_counts(sc)
                     dst_counts = self._get_schema_object_counts(dc)
@@ -397,11 +421,16 @@ class DBDataDiff:
                         all_rows.extend(rows)
 
         # 写 CSV
-        if wr:
-            for row in all_rows:
-                wr.writerow(row)
-            out.close()
-            info(f"校验结果已导出到：{output}")
+        if output:
+            try:
+                with open(output, 'w', newline='', encoding='utf-8') as out:
+                    wr = csv.writer(out)
+                    wr.writerow(["数据库", "表名", "源库条数", "目标库条数", "差额(绝对值)", "结果"])
+                    for row in all_rows:
+                        wr.writerow(row)
+                info(f"校验结果已导出到：{output}")
+            except Exception as e:
+                error(f"写入CSV文件失败：{str(e)}")
 
         # 汇总（仅对 rows 对比做汇总，其余结果已在日志输出）
         result_lines = []

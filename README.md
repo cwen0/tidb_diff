@@ -41,7 +41,7 @@ output = diff_result.csv
 compare = rows,tables,indexes,views
 
 # 并发线程数（仅 rows 对比使用，默认 1）
-concurrency = 4
+concurrency = 1
 
 # 可选 snapshot_ts（TiDB）
 # src.snapshot_ts = 462796050923520000
