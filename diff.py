@@ -14,10 +14,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 读取配置文件（默认读取当前目录的 config.ini）
-conf = configparser.ConfigParser(interpolation=None)
-conf.read("config.ini", encoding="utf-8")
-
 # 自定义日志辅助函数（脚本原有 info/error 函数，适配日志配置）
 def info(msg):
     logger.info(msg)
@@ -71,10 +67,10 @@ class DBDataDiff:
         cursor.close()
         return db_list
 
-    def diff(self):
+    def diff(self, conf):
         """
         比对源和目的端的数据库表数据记录条数，
-        连接参数需要在config.ini中配置，需要包含[diff]配置；
+        连接参数需要在配置文件中配置，需要包含[diff]配置；
         注意，比对两端的库名和表名必须同名。
         """
         threshold = 0
@@ -283,11 +279,34 @@ class DBDataDiff:
 
 # ---------------------- main 函数（命令行入口）----------------------
 def main():
+    import argparse
+    import os
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="数据库表记录数一致性校验工具")
+    parser.add_argument("--config", help="配置文件路径（默认：config.ini）", default="config.ini")
+    args = parser.parse_args()
+    
+    # 读取配置文件
+    config_path = args.config
+    if not os.path.exists(config_path):
+        error(f"配置文件不存在: {config_path}")
+        sys.exit(1)
+    
+    conf = configparser.ConfigParser(interpolation=None)
+    conf.read(config_path, encoding="utf-8")
+    
+    # 检查是否包含 [diff] 配置节
+    if "diff" not in conf:
+        error(f"配置文件中缺少 [diff] 配置节: {config_path}")
+        sys.exit(1)
+    
     # 初始化校验实例并执行
     diff_tool = DBDataDiff()
     try:
+        info(f"使用配置文件: {config_path}")
         info("开始数据库表记录数一致性校验...")
-        result = diff_tool.diff()
+        result = diff_tool.diff(conf)
         # 输出最终汇总结果
         info("\n" + "="*50)
         info("校验汇总结果：")

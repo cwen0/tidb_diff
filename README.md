@@ -1,5 +1,31 @@
 # 数据库表记录数一致性校验工具
 
+## 环境配置
+
+### 1. 创建 Python 虚拟环境
+
+```bash
+python3 -m venv devenv
+```
+
+### 2. 激活虚拟环境
+
+**macOS/Linux:**
+```bash
+source devenv/bin/activate
+```
+
+**Windows:**
+```bash
+devenv\Scripts\activate
+```
+
+### 3. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
 ## 功能说明
 
 用于比对源数据库和目标数据库中同名表的记录数，支持批量校验多个数据库。
@@ -21,6 +47,11 @@ output = diff_result.csv
 然后运行：
 ```bash
 python diff.py
+```
+
+或指定配置文件路径：
+```bash
+python3 diff.py --config config.ini > diff.log 2>&1
 ```
 
 ## 配置说明
