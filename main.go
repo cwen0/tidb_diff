@@ -67,6 +67,11 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 		return nil, fmt.Errorf("连接数据库失败: %v", err)
 	}
 
+	// 优化连接池设置以提高性能
+	db.SetMaxOpenConns(10)   // 最大打开连接数
+	db.SetMaxIdleConns(5)    // 最大空闲连接数
+	db.SetConnMaxLifetime(0) // 连接最大生存时间（0表示不限制）
+
 	return db, nil
 }
 
@@ -234,7 +239,7 @@ type CheckResult struct {
 	RowsForCSV [][]string
 }
 
-func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, threshold, batchSize int, srcSnapshotTS, dstSnapshotTS *string) CheckResult {
+func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string) CheckResult {
 	errList := []string{}
 	rowsForCSV := [][]string{}
 
@@ -310,59 +315,79 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 	}
 
-	info(fmt.Sprintf("DB【%s】共%d张表，开始数据行数校验...", db, len(srcTables)))
+	method := "精确COUNT"
+	if useStats {
+		method = "统计信息"
+	}
+	info(fmt.Sprintf("DB【%s】共%d张表，使用%s方式开始数据行数校验...", db, len(srcTables), method))
 
 	srcRet := make(map[string]int64)
 	dstRet := make(map[string]int64)
 
-	// Process in batches
-	for i := 0; i < len(srcTables); i += batchSize {
-		end := i + batchSize
-		if end > len(srcTables) {
-			end = len(srcTables)
-		}
-		currentSrcTables := srcTables[i:end]
-		currentDstTables := dstTables[i:end]
+	if useStats {
+		// 使用统计信息快速获取（一次性获取所有表，并行执行）
+		var statsWg sync.WaitGroup
+		var srcData map[string]int64
+		var dstData map[string]int64
+		var srcErr, dstErr error
+		statsWg.Add(2)
 
-		// Build UNION ALL queries
-		srcSQL := d.buildCountQuery(db, currentSrcTables)
-		dstSQL := d.buildCountQuery(db, currentDstTables)
-
-		// Execute source query
-		rows, err := srcDB.Query(srcSQL)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("查询源库失败：%v", err))
-			continue
-		}
-		for rows.Next() {
-			var tableName string
-			var count int64
-			if err := rows.Scan(&count, &tableName); err != nil {
-				rows.Close()
-				errList = append(errList, fmt.Sprintf("扫描源库结果失败：%v", err))
-				continue
+		go func() {
+			defer statsWg.Done()
+			srcData, srcErr = d.getTableRowCountsFromStats(srcDB, db, srcTables)
+			if srcErr != nil {
+				errList = append(errList, fmt.Sprintf("从统计信息获取源库行数失败：%v", srcErr))
 			}
-			srcRet[tableName] = count
-		}
-		rows.Close()
+		}()
 
-		// Execute destination query
-		rows, err = dstDB.Query(dstSQL)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("查询目标库失败：%v", err))
-			continue
-		}
-		for rows.Next() {
-			var tableName string
-			var count int64
-			if err := rows.Scan(&count, &tableName); err != nil {
-				rows.Close()
-				errList = append(errList, fmt.Sprintf("扫描目标库结果失败：%v", err))
-				continue
+		go func() {
+			defer statsWg.Done()
+			dstData, dstErr = d.getTableRowCountsFromStats(dstDB, db, dstTables)
+			if dstErr != nil {
+				errList = append(errList, fmt.Sprintf("从统计信息获取目标库行数失败：%v", dstErr))
 			}
-			dstRet[tableName] = count
+		}()
+
+		statsWg.Wait()
+		if srcData != nil {
+			srcRet = srcData
 		}
-		rows.Close()
+		if dstData != nil {
+			dstRet = dstData
+		}
+	} else {
+		// 使用精确 COUNT（表级别并发：每个表独立并发统计）
+		// 并行执行源库和目标库的表级别统计
+		var countWg sync.WaitGroup
+		var srcData, dstData map[string]int64
+		var srcErrList, dstErrList []error
+		countWg.Add(2)
+
+		// 并发统计源库所有表的行数
+		go func() {
+			defer countWg.Done()
+			srcData, srcErrList = d.countTableRowsConcurrent(srcDB, db, srcTables, tableConcurrency)
+			for _, err := range srcErrList {
+				errList = append(errList, err.Error())
+			}
+		}()
+
+		// 并发统计目标库所有表的行数
+		go func() {
+			defer countWg.Done()
+			dstData, dstErrList = d.countTableRowsConcurrent(dstDB, db, dstTables, tableConcurrency)
+			for _, err := range dstErrList {
+				errList = append(errList, err.Error())
+			}
+		}()
+
+		countWg.Wait()
+		if srcData != nil {
+			srcRet = srcData
+		}
+		if dstData != nil {
+			dstRet = dstData
+		}
 	}
 
 	// Compare results
@@ -425,12 +450,94 @@ func (d *DBDataDiff) removeIgnoredTables(tables []string, ignoreTables []string)
 	return result
 }
 
-func (d *DBDataDiff) buildCountQuery(db string, tables []string) string {
-	queries := []string{}
-	for _, table := range tables {
-		queries = append(queries, fmt.Sprintf("SELECT COUNT(1) AS cnt, '%s' AS table_name FROM `%s`.`%s`", table, db, table))
+// countTableRowsConcurrent 表级别并发统计：对每个表并发执行 COUNT(1)
+func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables []string, concurrency int) (map[string]int64, []error) {
+	result := make(map[string]int64)
+	var errList []error
+	var mu sync.Mutex
+
+	if len(tables) == 0 {
+		return result, errList
 	}
-	return strings.Join(queries, " UNION ALL ")
+
+	// 使用 channel 控制并发数
+	semaphore := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, table := range tables {
+		wg.Add(1)
+		go func(tblName string) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			// 对单个表执行 COUNT(1)
+			query := fmt.Sprintf("SELECT COUNT(1) AS cnt FROM `%s`.`%s`", dbName, tblName)
+			var count int64
+			err := db.QueryRow(query).Scan(&count)
+
+			mu.Lock()
+			if err != nil {
+				errList = append(errList, fmt.Errorf("表 %s 统计失败: %v", tblName, err))
+			} else {
+				result[tblName] = count
+			}
+			mu.Unlock()
+		}(table)
+	}
+
+	wg.Wait()
+	return result, errList
+}
+
+// getTableRowCountsFromStats 使用统计信息快速获取表行数（近似值，但非常快）
+func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, tables []string) (map[string]int64, error) {
+	result := make(map[string]int64)
+
+	if len(tables) == 0 {
+		return result, nil
+	}
+
+	// 初始化所有表为 0，确保即使统计信息中没有也能返回
+	for _, table := range tables {
+		result[table] = 0
+	}
+
+	// 构建 IN 子句的占位符
+	placeholders := make([]string, len(tables))
+	args := make([]interface{}, len(tables))
+	for i, table := range tables {
+		placeholders[i] = "?"
+		args[i] = table
+	}
+
+	query := fmt.Sprintf(`
+		SELECT TABLE_NAME, TABLE_ROWS 
+		FROM INFORMATION_SCHEMA.TABLES 
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (%s)
+	`, strings.Join(placeholders, ","))
+
+	args = append([]interface{}{schema}, args...)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName string
+		var rowCount sql.NullInt64
+		if err := rows.Scan(&tableName, &rowCount); err != nil {
+			return nil, err
+		}
+		if rowCount.Valid {
+			result[tableName] = rowCount.Int64
+		} else {
+			result[tableName] = 0
+		}
+	}
+
+	return result, rows.Err()
 }
 
 func (d *DBDataDiff) diff(conf *ini.File) string {
@@ -440,6 +547,21 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	concurrency := section.Key("concurrency").MustInt(1)
 	if concurrency < 1 {
 		concurrency = 1
+	}
+
+	// 是否使用统计信息快速获取行数（默认 true，速度快但可能不够精确）
+	useStats := section.Key("use_stats").MustBool(true)
+
+	// 批量大小（仅在使用精确 COUNT 时有效，默认 30 以提高性能）
+	batchSize := section.Key("batch_size").MustInt(30)
+	if batchSize < 1 {
+		batchSize = 30
+	}
+
+	// 表级别并发数（每个表独立并发统计时的并发数，默认 1）
+	tableConcurrency := section.Key("table_concurrency").MustInt(10)
+	if tableConcurrency < 1 {
+		tableConcurrency = 1
 	}
 
 	compareStr := section.Key("compare").String()
@@ -608,6 +730,12 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			errTls[db] = []string{}
 		}
 
+		if useStats {
+			info("使用统计信息模式（快速但可能不够精确），如需精确计数请设置 use_stats=false")
+		} else {
+			info(fmt.Sprintf("使用精确 COUNT 模式，表级别并发数：%d", tableConcurrency))
+		}
+
 		if concurrency <= 1 {
 			// Sequential processing
 			for _, db := range dbs {
@@ -618,7 +746,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 				if dstSnapshotTS != "" {
 					dstTS = &dstSnapshotTS
 				}
-				result := d.checkSingleDB(db, src, dst, ignoreTables, threshold, 5, srcTS, dstTS)
+				result := d.checkSingleDB(db, src, dst, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
 				errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 				allRows = append(allRows, result.RowsForCSV...)
 			}
@@ -643,7 +771,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					if dstSnapshotTS != "" {
 						dstTS = &dstSnapshotTS
 					}
-					result := d.checkSingleDB(dbName, src, dst, ignoreTables, threshold, 5, srcTS, dstTS)
+					result := d.checkSingleDB(dbName, src, dst, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
 
 					mu.Lock()
 					errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)

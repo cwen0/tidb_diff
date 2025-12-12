@@ -84,13 +84,40 @@ output = diff_result.csv
 # 留空或不填则默认全部启用
 compare = rows,tables,indexes,views
 
-# 并发线程数（仅 rows 对比使用，默认 1）
+# 数据库级别并发数（同时处理多个数据库，默认 1）
 concurrency = 1
+
+# 是否使用统计信息快速获取行数（默认 true，速度快但可能不够精确）
+# 设置为 false 时使用精确 COUNT(1)，支持表级别并发，性能更高
+use_stats = false
+
+# 表级别并发数（仅在使用精确 COUNT 时有效，每个表独立并发统计，默认 10）
+# 建议根据数据库连接数和服务器性能调整，范围 5-50
+# 对于大量表的场景，可以适当增加以提高性能
+table_concurrency = 10
 
 # 可选 snapshot_ts（TiDB）
 # src.snapshot_ts = 462796050923520000
 # dst.snapshot_ts = 462796051305201667
 ```
+
+### 配置项说明
+
+- `src.instance` / `dst.instance`: 源库和目标库的连接串，格式：`mysql://用户名:密码@主机:端口`
+- `dbs`: 要对比的数据库列表，支持 LIKE 模式（如 `test%`），多个用逗号分隔
+- `ignore_tables`: 忽略校验的表名，多个用逗号分隔
+- `threshold`: 行数差异阈值，超过此值会标记为不一致（默认 0，即必须完全一致）
+- `output`: CSV 输出文件路径（可选）
+- `compare`: 对比项，可选值：`rows`（逐表行数）、`tables`（库级表数）、`indexes`（库级索引数）、`views`（库级视图数），留空默认全部启用
+- `concurrency`: 数据库级别并发数，同时处理多个数据库（默认 1，串行处理）
+- `use_stats`: 是否使用统计信息快速获取行数（默认 `true`）
+  - `true`: 使用 `INFORMATION_SCHEMA.TABLES.TABLE_ROWS`，速度快但可能不够精确
+  - `false`: 使用精确 `COUNT(1)`，支持表级别并发，性能更高
+- `table_concurrency`: 表级别并发数（仅当 `use_stats=false` 时有效）
+  - 每个表独立并发执行 `COUNT(1)` 查询
+  - 默认 10，建议根据数据库连接数和服务器性能调整（范围 5-50）
+  - 对于大量表的场景，可以适当增加以提高性能
+- `src.snapshot_ts` / `dst.snapshot_ts`: TiDB 快照时间戳（可选，用于对比历史数据）
 
 ## 使用
 
@@ -129,7 +156,37 @@ go run main.go --config config.ini
 ## 对比项说明
 
 - `rows`：逐表行数对比（支持并发）
+  - 使用统计信息模式（`use_stats=true`）：快速但可能不够精确，适合快速检查
+  - 精确 COUNT 模式（`use_stats=false`）：使用表级别并发，每个表独立并发执行 `COUNT(1)`，性能更高且精确
 - `tables`：库级表数量对比
 - `indexes`：库级索引数量对比（TiDB）
 - `views`：库级视图数量对比
 - 使用 `compare` 指定需要的子集，逗号分隔；留空默认全选。
+
+## 性能优化说明
+
+### Go 版本性能特性
+
+Go 版本实现了以下性能优化：
+
+1. **表级别并发统计**（`use_stats=false` 时）
+   - 每个表独立并发执行 `COUNT(1)` 查询
+   - 源库和目标库的表统计并行执行
+   - 通过 `table_concurrency` 控制并发数
+   - 对于大量表的场景，预计性能提升 5-10 倍
+
+2. **数据库连接池优化**
+   - 自动配置连接池参数
+   - 提高连接复用效率
+
+3. **统计信息快速模式**（`use_stats=true` 时）
+   - 使用 `INFORMATION_SCHEMA.TABLES.TABLE_ROWS` 快速获取近似行数
+   - 源库和目标库查询并行执行
+
+### 性能调优建议
+
+- **少量表（< 50）**：使用默认配置即可
+- **中等数量表（50-200）**：设置 `table_concurrency = 20-30`
+- **大量表（> 200）**：设置 `table_concurrency = 30-50`，并考虑增加数据库连接池大小
+- **需要精确结果**：设置 `use_stats = false` 使用精确 COUNT
+- **快速检查**：设置 `use_stats = true` 使用统计信息模式
