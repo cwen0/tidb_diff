@@ -9,6 +9,8 @@
 
 ## 安装
 
+### Python 版本
+
 ```bash
 git clone https://github.com/asddongmen/tidb_diff.git
 cd tidb_diff
@@ -22,6 +24,48 @@ pip install -r requirements.txt
 ```
 
 依赖：`pymysql`
+
+### Go 版本
+
+```bash
+git clone https://github.com/asddongmen/tidb_diff.git
+cd tidb_diff
+
+# 安装依赖
+go mod download
+# 或使用 Makefile
+make deps
+
+# 编译（可选）
+go build -o tidb_diff main.go
+# 或使用 Makefile
+make build
+```
+
+依赖：
+- `github.com/go-sql-driver/mysql` - MySQL/TiDB 驱动
+- `gopkg.in/ini.v1` - INI 配置文件解析
+
+#### 使用 Makefile 编译 Linux 版本
+
+```bash
+# 编译 Linux amd64 和 arm64 版本
+make linux
+
+# 仅编译 Linux amd64 版本
+make linux-amd64
+
+# 仅编译 Linux arm64 版本
+make linux-arm64
+
+# 编译所有平台（Linux, macOS, Windows）
+make build-all
+
+# 查看所有可用命令
+make help
+```
+
+编译后的二进制文件位于 `build/linux/amd64/tidb_diff` 和 `build/linux/arm64/tidb_diff`
 
 ## 配置
 
@@ -50,10 +94,27 @@ concurrency = 1
 
 ## 使用
 
+### Python 版本
+
 ```bash
 python diff.py                  # 使用默认 config.ini
 # 或指定配置并输出到日志
 python diff.py --config config.ini > diff.log 2>&1
+```
+
+### Go 版本
+
+```bash
+# 直接运行
+go run main.go                  # 使用默认 config.ini
+go run main.go --config config.ini
+
+# 或使用编译后的二进制文件
+./tidb_diff                     # 使用默认 config.ini
+./tidb_diff --config config.ini
+
+# 输出到日志
+./tidb_diff --config config.ini > diff.log 2>&1
 ```
 
 ## 输出

@@ -9,3 +9,4 @@
 .coverage.*
 devenv
 diff_result.csv
+build/
