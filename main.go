@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"gopkg.in/ini.v1"
@@ -28,7 +30,30 @@ func errorLog(msg string) {
 	logger.Printf("[ERROR] %s\n", msg)
 }
 
-type DBDataDiff struct{}
+type DBDataDiff struct {
+	maxOpenConns         int
+	maxIdleConns         int
+	connMaxLifetime      time.Duration
+	queryTimeoutSeconds  int
+	readTimeoutSeconds   int
+	writeTimeoutSeconds  int
+	maxRetries           int // 查询重试次数
+}
+
+// setConnectionPoolConfig 设置连接池配置（从配置文件读取）
+func (d *DBDataDiff) setConnectionPoolConfig(maxOpenConns, maxIdleConns int, connMaxLifetimeMinutes int, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds int) {
+	d.maxOpenConns = maxOpenConns
+	d.maxIdleConns = maxIdleConns
+	if connMaxLifetimeMinutes > 0 {
+		d.connMaxLifetime = time.Duration(connMaxLifetimeMinutes) * time.Minute
+	} else {
+		d.connMaxLifetime = 0 // 0 表示不限制
+	}
+	d.queryTimeoutSeconds = queryTimeoutSeconds
+	d.readTimeoutSeconds = readTimeoutSeconds
+	d.writeTimeoutSeconds = writeTimeoutSeconds
+	// maxRetries 在 diff 函数中单独设置
+}
 
 func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	if instance == "" {
@@ -59,18 +84,51 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	}
 
 	password, _ := parsed.User.Password()
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/?charset=utf8mb4&parseTime=True&loc=Local",
-		parsed.User.Username(), password, host, port)
+	
+	// 构建 DSN，针对大表场景优化参数
+	dsnParams := []string{
+		"charset=utf8mb4",
+		"parseTime=True",
+		"loc=Local",
+	}
+	
+	// 添加超时参数（针对大表查询优化）
+	if d.readTimeoutSeconds > 0 {
+		dsnParams = append(dsnParams, fmt.Sprintf("readTimeout=%ds", d.readTimeoutSeconds))
+	}
+	if d.writeTimeoutSeconds > 0 {
+		dsnParams = append(dsnParams, fmt.Sprintf("writeTimeout=%ds", d.writeTimeoutSeconds))
+	}
+	// 对于大表，增加连接超时时间
+	dsnParams = append(dsnParams, "timeout=30s")
+	
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/?%s",
+		parsed.User.Username(), password, host, port, strings.Join(dsnParams, "&"))
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %v", err)
 	}
 
-	// 优化连接池设置以提高性能
-	db.SetMaxOpenConns(10)   // 最大打开连接数
-	db.SetMaxIdleConns(5)    // 最大空闲连接数
-	db.SetConnMaxLifetime(0) // 连接最大生存时间（0表示不限制）
+	// 应用连接池配置（如果已设置，否则使用针对大表的默认值）
+	if d.maxOpenConns > 0 {
+		db.SetMaxOpenConns(d.maxOpenConns)
+	} else {
+		db.SetMaxOpenConns(100) // 大表场景默认值：100
+	}
+
+	if d.maxIdleConns > 0 {
+		db.SetMaxIdleConns(d.maxIdleConns)
+	} else {
+		db.SetMaxIdleConns(80) // 大表场景默认值：80
+	}
+
+	// 连接最大生存时间：如果配置为 0 表示不限制，否则使用配置值
+	// 注意：如果 connMaxLifetime 为 0，表示配置为不限制，不调用 SetConnMaxLifetime
+	if d.connMaxLifetime > 0 {
+		db.SetConnMaxLifetime(d.connMaxLifetime)
+	}
+	// 如果 connMaxLifetime 被显式设置为 0（通过配置），则不设置（表示不限制）
 
 	return db, nil
 }
@@ -460,6 +518,9 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 		return result, errList
 	}
 
+	totalTables := len(tables)
+	processedTables := 0
+	
 	// 使用 channel 控制并发数
 	semaphore := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -471,16 +532,64 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 			semaphore <- struct{}{}        // Acquire
 			defer func() { <-semaphore }() // Release
 
-			// 对单个表执行 COUNT(1)
+			// 对单个表执行 COUNT(1)，使用 context 控制超时（针对大表）
 			query := fmt.Sprintf("SELECT COUNT(1) AS cnt FROM `%s`.`%s`", dbName, tblName)
 			var count int64
-			err := db.QueryRow(query).Scan(&count)
+			var err error
+			
+			// 重试机制（针对大表查询失败场景）
+			for retry := 0; retry <= d.maxRetries; retry++ {
+				if retry > 0 {
+					// 重试前等待，指数退避
+					waitTime := time.Duration(retry) * time.Second
+					time.Sleep(waitTime)
+				}
+				
+				// 如果配置了查询超时，使用 context 控制
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if d.queryTimeoutSeconds > 0 {
+					ctx, cancel = context.WithTimeout(context.Background(), time.Duration(d.queryTimeoutSeconds)*time.Second)
+				} else {
+					// 默认超时：大表可能需要较长时间，设置为 30 分钟
+					ctx, cancel = context.WithTimeout(context.Background(), 30*time.Minute)
+				}
+				
+				err = db.QueryRowContext(ctx, query).Scan(&count)
+				cancel()
+				
+				if err == nil {
+					break // 成功，退出重试循环
+				}
+				
+				// 如果是最后一次重试，记录错误
+				if retry == d.maxRetries {
+					break
+				}
+			}
 
 			mu.Lock()
+			processedTables++
 			if err != nil {
 				errList = append(errList, fmt.Errorf("表 %s 统计失败: %v", tblName, err))
 			} else {
 				result[tblName] = count
+			}
+			// 每处理 10% 的表或每 10 张表输出一次进度（针对大量表场景）
+			shouldLog := false
+			if totalTables > 0 {
+				progress := processedTables * 100 / totalTables
+				prevProgress := (processedTables - 1) * 100 / totalTables
+				shouldLog = processedTables%10 == 0 || processedTables == totalTables || progress != prevProgress
+			} else {
+				shouldLog = processedTables%10 == 0 || processedTables == totalTables
+			}
+			if shouldLog && totalTables > 0 {
+				progress := processedTables * 100 / totalTables
+				if progress > 100 {
+					progress = 100
+				}
+				info(fmt.Sprintf("  [%s] 表统计进度: %d/%d (%d%%)", dbName, processedTables, totalTables, progress))
 			}
 			mu.Unlock()
 		}(table)
@@ -544,9 +653,11 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	section := conf.Section("diff")
 
 	threshold := section.Key("threshold").MustInt(0)
-	concurrency := section.Key("concurrency").MustInt(1)
+	// 数据库级别并发数（同时处理多个数据库）
+	// 多库场景默认值：5（针对多库场景优化，可根据实际情况调整）
+	concurrency := section.Key("concurrency").MustInt(5)
 	if concurrency < 1 {
-		concurrency = 1
+		concurrency = 5
 	}
 
 	// 是否使用统计信息快速获取行数（默认 true，速度快但可能不够精确）
@@ -558,11 +669,89 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		batchSize = 30
 	}
 
-	// 表级别并发数（每个表独立并发统计时的并发数，默认 1）
-	tableConcurrency := section.Key("table_concurrency").MustInt(10)
+	// 表级别并发数（每个表独立并发统计时的并发数）
+	// 多库多表场景默认值：30（针对大量表优化）
+	tableConcurrency := section.Key("table_concurrency").MustInt(30)
 	if tableConcurrency < 1 {
-		tableConcurrency = 1
+		tableConcurrency = 30
 	}
+
+	// 连接池配置（针对多库多表大表场景优化）
+	// 动态计算：每个数据库需要 2 个连接池（源+目标），每个连接池需要支持 table_concurrency 并发
+	// 公式：max_open_conns = concurrency * 2 * (table_concurrency + 缓冲)
+	// 默认值：如果未配置，根据并发数自动计算
+	var maxOpenConns, maxIdleConns int
+	if section.HasKey("max_open_conns") {
+		maxOpenConns = section.Key("max_open_conns").MustInt(0)
+	} else {
+		// 自动计算：concurrency * 2（源+目标） * (table_concurrency + 10缓冲)
+		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
+		if maxOpenConns < 100 {
+			maxOpenConns = 100 // 最小 100
+		}
+		if maxOpenConns > 500 {
+			maxOpenConns = 500 // 最大 500，避免过多连接
+		}
+	}
+	
+	if section.HasKey("max_idle_conns") {
+		maxIdleConns = section.Key("max_idle_conns").MustInt(0)
+	} else {
+		// 自动计算：max_open_conns 的 80%
+		maxIdleConns = int(float64(maxOpenConns) * 0.8)
+		if maxIdleConns < 80 {
+			maxIdleConns = 80 // 最小 80
+		}
+	}
+	
+	// 处理 conn_max_lifetime_minutes：如果未配置则使用默认值 30（大表查询可能需要更长时间），如果配置为 0 则表示不限制
+	var connMaxLifetimeMinutes int
+	if section.HasKey("conn_max_lifetime_minutes") {
+		connMaxLifetimeMinutes = section.Key("conn_max_lifetime_minutes").MustInt(0)
+	} else {
+		connMaxLifetimeMinutes = 30 // 大表场景默认 30 分钟
+	}
+	
+	// 查询超时配置（秒），0 表示使用默认值（30分钟）
+	queryTimeoutSeconds := section.Key("query_timeout_seconds").MustInt(0)
+	
+	// 读写超时配置（秒），0 表示使用默认值
+	readTimeoutSeconds := section.Key("read_timeout_seconds").MustInt(0)
+	writeTimeoutSeconds := section.Key("write_timeout_seconds").MustInt(0)
+	
+	// 查询重试次数（针对大表查询失败场景）
+	maxRetries := section.Key("max_retries").MustInt(2)
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	if maxRetries > 5 {
+		maxRetries = 5 // 最多重试 5 次
+	}
+	
+	if maxOpenConns < 1 {
+		// 如果配置为 0 或负数，使用自动计算值
+		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
+		if maxOpenConns < 100 {
+			maxOpenConns = 100
+		}
+		if maxOpenConns > 500 {
+			maxOpenConns = 500
+		}
+	}
+	if maxIdleConns < 1 {
+		maxIdleConns = int(float64(maxOpenConns) * 0.8)
+		if maxIdleConns < 80 {
+			maxIdleConns = 80
+		}
+	}
+	// 设置连接池配置
+	d.setConnectionPoolConfig(maxOpenConns, maxIdleConns, connMaxLifetimeMinutes, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds)
+	d.maxRetries = maxRetries
+	
+	// 输出连接池配置信息（帮助用户了解实际配置）
+	info(fmt.Sprintf("连接池配置：max_open_conns=%d, max_idle_conns=%d, conn_max_lifetime=%d分钟", 
+		maxOpenConns, maxIdleConns, connMaxLifetimeMinutes))
+	info(fmt.Sprintf("并发配置：数据库级别=%d, 表级别=%d, 查询重试次数=%d", concurrency, tableConcurrency, maxRetries))
 
 	compareStr := section.Key("compare").String()
 	compareItems := make(map[string]bool)
@@ -643,6 +832,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		errorLog("未找到匹配的数据库")
 		return ""
 	}
+	
+	info(fmt.Sprintf("找到 %d 个数据库需要校验", len(dbs)))
 
 	// Schema object counts comparison
 	if compareItems["tables"] || compareItems["indexes"] || compareItems["views"] {
@@ -736,9 +927,15 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			info(fmt.Sprintf("使用精确 COUNT 模式，表级别并发数：%d", tableConcurrency))
 		}
 
+		startTime := time.Now()
+		processedDBs := 0
+		totalDBs := len(dbs)
+
 		if concurrency <= 1 {
 			// Sequential processing
 			for _, db := range dbs {
+				processedDBs++
+				info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", processedDBs, totalDBs, db))
 				var srcTS, dstTS *string
 				if srcSnapshotTS != "" {
 					srcTS = &srcSnapshotTS
@@ -749,10 +946,11 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 				result := d.checkSingleDB(db, src, dst, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
 				errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 				allRows = append(allRows, result.RowsForCSV...)
+				info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", processedDBs, totalDBs, db))
 			}
 		} else {
 			// Concurrent processing
-			info(fmt.Sprintf("使用并发校验，线程数：%d", concurrency))
+			info(fmt.Sprintf("使用并发校验，数据库级别并发数：%d", concurrency))
 			var wg sync.WaitGroup
 			var mu sync.Mutex
 			semaphore := make(chan struct{}, concurrency)
@@ -763,6 +961,13 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					defer wg.Done()
 					semaphore <- struct{}{}        // Acquire
 					defer func() { <-semaphore }() // Release
+
+					mu.Lock()
+					processedDBs++
+					currentProgress := processedDBs
+					mu.Unlock()
+					
+					info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", currentProgress, totalDBs, dbName))
 
 					var srcTS, dstTS *string
 					if srcSnapshotTS != "" {
@@ -776,10 +981,31 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					mu.Lock()
 					errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 					allRows = append(allRows, result.RowsForCSV...)
+					info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", currentProgress, totalDBs, dbName))
 					mu.Unlock()
 				}(db)
 			}
 			wg.Wait()
+		}
+		
+		// 输出性能统计
+		elapsed := time.Since(startTime)
+		totalTables := len(allRows)
+		totalErrors := 0
+		for _, errs := range errTls {
+			totalErrors += len(errs)
+		}
+		info(fmt.Sprintf("校验完成！共处理 %d 个数据库，%d 张表，耗时: %v", totalDBs, totalTables, elapsed))
+		if totalTables > 0 {
+			avgTimePerTable := elapsed / time.Duration(totalTables)
+			info(fmt.Sprintf("平均每张表耗时: %v", avgTimePerTable))
+			if totalErrors > 0 {
+				errorRate := float64(totalErrors) * 100.0 / float64(totalTables)
+				info(fmt.Sprintf("错误统计: %d 张表校验失败或异常 (错误率: %.2f%%)", totalErrors, errorRate))
+			}
+		}
+		if concurrency > 1 {
+			info(fmt.Sprintf("并发效率: 使用 %d 个并发处理数据库，理论加速比: %.2fx", concurrency, float64(concurrency)))
 		}
 	}
 

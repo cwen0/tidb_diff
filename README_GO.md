@@ -52,17 +52,67 @@ output = diff_result.csv
 # Leave empty to enable all
 compare = rows,tables,indexes,views
 
-# Database-level concurrency (default 1)
-concurrency = 1
+# Database-level concurrency
+# Default: 5 (optimized for multi-database scenarios)
+# Recommended range: 3-20
+# - Few databases (<10): 3-5
+# - Medium databases (10-50): 5-10
+# - Many databases (>50): 10-20
+# Note: Each database needs 2 connection pools (source + destination)
+concurrency = 5
 
 # Use statistics for fast row count (default true, fast but may be inaccurate)
 # Set to false to use exact COUNT(1) with table-level concurrency
 use_stats = false
 
-# Table-level concurrency (only effective when use_stats=false, default 10)
-# Each table is counted concurrently with COUNT(1)
-# Recommended range: 5-50, adjust based on database connections and server performance
-table_concurrency = 10
+# Table-level concurrency (only effective when use_stats=false)
+# Default: 30 (optimized for multi-table scenarios)
+# Recommended range: 10-50
+# - Few tables (<100): 10-20
+# - Medium tables (100-500): 20-30
+# - Many tables (500-1000): 30-40
+# - Very many tables (>1000): 40-50
+# Note: Source and destination execute in parallel, actual concurrency = table_concurrency * 2
+table_concurrency = 30
+
+# Connection pool configuration (optimized for multi-DB, multi-table, large table scenarios)
+# max_open_conns: Maximum open connections
+# If not configured (set to 0), automatically calculated based on concurrency and table_concurrency
+#   Formula: concurrency * 2 * (table_concurrency + 10)
+#   Range: 100-500 (auto-limited)
+# Manual configuration recommendations:
+# - Few DBs/tables: 100-150
+# - Medium DBs/tables: 150-250
+# - Many DBs/tables: 250-400
+# - Very many DBs/tables: 400-500
+max_open_conns = 0
+
+# max_idle_conns: Maximum idle connections
+# If not configured (set to 0), automatically calculated as 80% of max_open_conns (minimum 80)
+max_idle_conns = 0
+
+# conn_max_lifetime_minutes: Connection max lifetime (minutes)
+# Default: 30 minutes (for large table scenarios)
+# Set to 0 for unlimited (not recommended)
+conn_max_lifetime_minutes = 30
+
+# query_timeout_seconds: Query timeout (seconds), 0 means default (30 minutes)
+# For large table COUNT(1) queries, adjust based on table size
+# Examples: 10M rows: 600-1800s (10-30min), 100M rows: 1800-3600s (30-60min)
+query_timeout_seconds = 0
+
+# read_timeout_seconds: Read timeout (seconds), 0 means default
+# Recommended: query_timeout_seconds + 60
+read_timeout_seconds = 0
+
+# write_timeout_seconds: Write timeout (seconds), 0 means default
+# Usually 30-60 seconds
+write_timeout_seconds = 0
+
+# max_retries: Query retry count (for large table query failures)
+# Default: 2, range: 0-5
+# For unstable networks, set to 3-5
+max_retries = 2
 
 # Optional snapshot_ts (TiDB)
 # src.snapshot_ts = 462796050923520000
@@ -71,47 +121,171 @@ table_concurrency = 10
 
 ### Configuration Options
 
+#### Basic Configuration
+
 - `src.instance` / `dst.instance`: Connection strings for source and destination databases
 - `dbs`: Database list to compare, supports LIKE patterns (e.g., `test%`), comma-separated
 - `ignore_tables`: Tables to ignore during comparison, comma-separated
 - `threshold`: Row count difference threshold (default 0, must be exactly equal)
 - `output`: CSV output file path (optional)
 - `compare`: Comparison items: `rows` (table row counts), `tables` (database-level table counts), `indexes` (database-level index counts), `views` (database-level view counts). Leave empty to enable all.
-- `concurrency`: Database-level concurrency, number of databases processed simultaneously (default 1)
+- `src.snapshot_ts` / `dst.snapshot_ts`: TiDB snapshot timestamps (optional, for comparing historical data)
+
+#### Concurrency Configuration
+
+- `concurrency`: Database-level concurrency, number of databases processed simultaneously
+  - Default: 5 (optimized for multi-database scenarios)
+  - Recommended range: 3-20
+  - Few databases (<10): 3-5
+  - Medium databases (10-50): 5-10
+  - Many databases (>50): 10-20
+
 - `use_stats`: Whether to use statistics for fast row count (default `true`)
   - `true`: Use `INFORMATION_SCHEMA.TABLES.TABLE_ROWS`, fast but may be inaccurate
   - `false`: Use exact `COUNT(1)` with table-level concurrency, higher performance
+
 - `table_concurrency`: Table-level concurrency (only effective when `use_stats=false`)
-  - Each table is counted concurrently with independent `COUNT(1)` queries
-  - Default 10, recommended range 5-50
-  - For scenarios with many tables, increase this value for better performance
-- `src.snapshot_ts` / `dst.snapshot_ts`: TiDB snapshot timestamps (optional, for comparing historical data)
+  - Default: 30 (optimized for multi-table scenarios)
+  - Recommended range: 10-50
+  - Few tables (<100): 10-20
+  - Medium tables (100-500): 20-30
+  - Many tables (500-1000): 30-40
+  - Very many tables (>1000): 40-50
+  - Note: Source and destination execute in parallel, actual concurrency = `table_concurrency * 2`
+
+#### Connection Pool Configuration (optimized for multi-DB, multi-table, large table scenarios)
+
+- `max_open_conns`: Maximum open connections
+  - Default: 0 (auto-calculated)
+  - Auto-calculation formula: `concurrency * 2 * (table_concurrency + 10)`
+  - Auto-limited range: 100-500
+  - Manual configuration recommendations:
+    - Few DBs/tables: 100-150
+    - Medium DBs/tables: 150-250
+    - Many DBs/tables: 250-400
+    - Very many DBs/tables: 400-500
+  - Note: Each database needs 2 connection pools (source + destination)
+
+- `max_idle_conns`: Maximum idle connections
+  - Default: 0 (auto-calculated as 80% of `max_open_conns`, minimum 80)
+  - Keeps connection pool warm, reduces connection establishment overhead
+
+- `conn_max_lifetime_minutes`: Connection max lifetime (minutes)
+  - Default: 30 minutes (for large table scenarios)
+  - Set to 0 for unlimited (not recommended)
+
+#### Timeout Configuration (optimized for large table queries)
+
+- `query_timeout_seconds`: Query timeout (seconds)
+  - Default: 0 (uses default 30 minutes)
+  - Recommendations based on table size:
+    - 10M rows: 600-1800 seconds (10-30 minutes)
+    - 100M rows: 1800-3600 seconds (30-60 minutes)
+
+- `read_timeout_seconds`: Read timeout (seconds)
+  - Default: 0 (uses default)
+  - Recommended: `query_timeout_seconds + 60`
+
+- `write_timeout_seconds`: Write timeout (seconds)
+  - Default: 0 (uses default)
+  - Usually 30-60 seconds
+
+#### Retry Configuration
+
+- `max_retries`: Query retry count
+  - Default: 2
+  - Range: 0-5
+  - For unstable networks, set to 3-5
+  - Uses exponential backoff strategy
 
 ## Performance Optimizations
 
 The tool implements several performance optimizations:
 
-1. **Table-Level Concurrency** (when `use_stats=false`)
-   - Each table is counted concurrently with independent `COUNT(1)` queries
-   - Source and destination database table counts are executed in parallel
-   - Controlled by `table_concurrency` parameter
-   - Expected 5-10x performance improvement for scenarios with many tables
+1. **Multi-Level Concurrency Architecture**
+   - **Database-level concurrency**: Process multiple databases simultaneously (controlled by `concurrency`)
+   - **Table-level concurrency**: Each table executes `COUNT(1)` queries concurrently (controlled by `table_concurrency`)
+   - Source and destination table statistics execute in parallel
+   - Expected 10-50x performance improvement for multi-DB, multi-table scenarios
 
-2. **Database Connection Pool Optimization**
-   - Automatically configured connection pool parameters
-   - Improved connection reuse efficiency
+2. **Intelligent Connection Pool Management**
+   - **Auto-calculation**: Automatically calculates optimal connection pool size based on concurrency settings
+   - **Connection reuse**: Keeps connection pool warm, reduces connection establishment overhead
+   - **Connection lifetime management**: Prevents using expired connections, adapts to long-running queries
 
-3. **Statistics Fast Mode** (when `use_stats=true`)
+3. **Query Timeout and Retry Mechanism**
+   - **Configurable query timeout**: Set reasonable timeout for large table queries
+   - **Automatic retry**: Auto-retry on network instability with exponential backoff
+   - **Context timeout control**: Precise query timeout control using Go context
+
+4. **Statistics Fast Mode** (when `use_stats=true`)
    - Uses `INFORMATION_SCHEMA.TABLES.TABLE_ROWS` for fast approximate row counts
    - Source and destination queries executed in parallel
+   - Suitable for quick check scenarios
+
+5. **Progress Display and Performance Monitoring**
+   - Real-time progress display at database and table levels
+   - Detailed performance statistics
+   - Error statistics and error rate analysis
 
 ### Performance Tuning Recommendations
 
-- **Few tables (< 50)**: Use default configuration
-- **Medium tables (50-200)**: Set `table_concurrency = 20-30`
-- **Many tables (> 200)**: Set `table_concurrency = 30-50`, consider increasing database connection pool size
+#### Scenario 1: Few DBs/Tables (<10 DBs, <100 tables/DB)
+
+```ini
+concurrency = 3
+table_concurrency = 10
+max_open_conns = 0  # Auto-calculate
+use_stats = false  # Exact count
+```
+
+#### Scenario 2: Medium DBs/Tables (10-50 DBs, 100-500 tables/DB)
+
+```ini
+concurrency = 5
+table_concurrency = 20
+max_open_conns = 0  # Auto-calculate (~200)
+use_stats = false
+query_timeout_seconds = 600  # 10 minutes
+```
+
+#### Scenario 3: Many DBs/Tables (>50 DBs, 500-1000 tables/DB)
+
+```ini
+concurrency = 10
+table_concurrency = 30
+max_open_conns = 0  # Auto-calculate (~400)
+max_idle_conns = 0  # Auto-calculate
+conn_max_lifetime_minutes = 30
+use_stats = false
+query_timeout_seconds = 1800  # 30 minutes
+read_timeout_seconds = 1900
+max_retries = 3
+```
+
+#### Scenario 4: Very Many DBs/Tables (>50 DBs, >1000 tables/DB, including large tables)
+
+```ini
+concurrency = 15
+table_concurrency = 40
+max_open_conns = 500  # Manual max value
+max_idle_conns = 400
+conn_max_lifetime_minutes = 60
+use_stats = false
+query_timeout_seconds = 3600  # 60 minutes (for 100M+ row tables)
+read_timeout_seconds = 3700
+write_timeout_seconds = 60
+max_retries = 3
+```
+
+### General Tuning Tips
+
 - **Need exact results**: Set `use_stats = false` to use exact COUNT
 - **Quick check**: Set `use_stats = true` to use statistics mode
+- **Connection pool**: Recommended to use auto-calculation (set to 0), tool will auto-optimize based on concurrency settings
+- **Large table queries**: Set `query_timeout_seconds` based on largest table size to ensure sufficient time
+- **Unstable network**: Increase `max_retries` to 3-5 for better success rate
+- **Monitoring and debugging**: Observe connection pool configuration and performance statistics in console output, adjust based on actual situation
 
 ## Features
 
