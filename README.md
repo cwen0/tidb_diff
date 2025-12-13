@@ -55,7 +55,7 @@ make help
 
 ```bash
 # 下载预编译的二进制文件包（请替换为实际的版本号和仓库地址）
-wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.2/build.tar.gz
+wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.3/build.tar.gz
 
 # 解压
 tar -zxvf build.tar.gz
@@ -77,7 +77,7 @@ vi config.ini
 ```
 
 **注意**：
-- 请将 `v0.0.2` 替换为最新的版本号
+- 请将 `v0.0.3` 替换为最新的版本号
 - 请将 `cwen0/tidb_diff` 替换为实际的 GitHub 仓库地址
 - 根据你的系统架构（amd64 或 arm64）和操作系统（Linux、macOS、Windows）选择对应的二进制文件
 - 首次运行前需要编辑 `config.ini` 配置文件，设置正确的数据库连接信息
