@@ -31,13 +31,13 @@ func errorLog(msg string) {
 }
 
 type DBDataDiff struct {
-	maxOpenConns         int
-	maxIdleConns         int
-	connMaxLifetime      time.Duration
-	queryTimeoutSeconds  int
-	readTimeoutSeconds   int
-	writeTimeoutSeconds  int
-	maxRetries           int // 查询重试次数
+	maxOpenConns        int
+	maxIdleConns        int
+	connMaxLifetime     time.Duration
+	queryTimeoutSeconds int
+	readTimeoutSeconds  int
+	writeTimeoutSeconds int
+	maxRetries          int // 查询重试次数
 }
 
 // setConnectionPoolConfig 设置连接池配置（从配置文件读取）
@@ -84,14 +84,14 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	}
 
 	password, _ := parsed.User.Password()
-	
+
 	// 构建 DSN，针对大表场景优化参数
 	dsnParams := []string{
 		"charset=utf8mb4",
 		"parseTime=True",
 		"loc=Local",
 	}
-	
+
 	// 添加超时参数（针对大表查询优化）
 	if d.readTimeoutSeconds > 0 {
 		dsnParams = append(dsnParams, fmt.Sprintf("readTimeout=%ds", d.readTimeoutSeconds))
@@ -101,7 +101,7 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	}
 	// 对于大表，增加连接超时时间
 	dsnParams = append(dsnParams, "timeout=30s")
-	
+
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/?%s",
 		parsed.User.Username(), password, host, port, strings.Join(dsnParams, "&"))
 
@@ -306,14 +306,38 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		errList = append(errList, fmt.Sprintf("连接源库失败：%v", err))
 		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 	}
-	defer srcDB.Close()
+	defer func() {
+		// 使用 goroutine 和超时来关闭连接，避免阻塞
+		done := make(chan struct{})
+		go func() {
+			srcDB.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			// 5秒超时后强制退出，避免无限等待
+		}
+	}()
 
 	dstDB, err := d.getConnection(dst)
 	if err != nil {
 		errList = append(errList, fmt.Sprintf("连接目标库失败：%v", err))
 		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 	}
-	defer dstDB.Close()
+	defer func() {
+		// 使用 goroutine 和超时来关闭连接，避免阻塞
+		done := make(chan struct{})
+		go func() {
+			dstDB.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			// 5秒超时后强制退出，避免无限等待
+		}
+	}()
 
 	// Set snapshot timestamps if provided
 	if srcSnapshotTS != nil && *srcSnapshotTS != "" {
@@ -520,7 +544,7 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 
 	totalTables := len(tables)
 	processedTables := 0
-	
+
 	// 使用 channel 控制并发数
 	semaphore := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -536,7 +560,7 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 			query := fmt.Sprintf("SELECT COUNT(1) AS cnt FROM `%s`.`%s`", dbName, tblName)
 			var count int64
 			var err error
-			
+
 			// 重试机制（针对大表查询失败场景）
 			for retry := 0; retry <= d.maxRetries; retry++ {
 				if retry > 0 {
@@ -544,24 +568,25 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 					waitTime := time.Duration(retry) * time.Second
 					time.Sleep(waitTime)
 				}
-				
+
 				// 如果配置了查询超时，使用 context 控制
 				var ctx context.Context
 				var cancel context.CancelFunc
 				if d.queryTimeoutSeconds > 0 {
 					ctx, cancel = context.WithTimeout(context.Background(), time.Duration(d.queryTimeoutSeconds)*time.Second)
 				} else {
-					// 默认超时：大表可能需要较长时间，设置为 30 分钟
-					ctx, cancel = context.WithTimeout(context.Background(), 30*time.Minute)
+					// 默认超时：大表可能需要较长时间，但设置一个合理的上限（10分钟）
+					// 避免查询时间过长导致程序卡住
+					ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
 				}
-				
+				defer cancel() // 确保 context 被取消，释放资源
+
 				err = db.QueryRowContext(ctx, query).Scan(&count)
-				cancel()
-				
+
 				if err == nil {
 					break // 成功，退出重试循环
 				}
-				
+
 				// 如果是最后一次重试，记录错误
 				if retry == d.maxRetries {
 					break
@@ -693,7 +718,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			maxOpenConns = 500 // 最大 500，避免过多连接
 		}
 	}
-	
+
 	if section.HasKey("max_idle_conns") {
 		maxIdleConns = section.Key("max_idle_conns").MustInt(0)
 	} else {
@@ -703,7 +728,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			maxIdleConns = 80 // 最小 80
 		}
 	}
-	
+
 	// 处理 conn_max_lifetime_minutes：如果未配置则使用默认值 30（大表查询可能需要更长时间），如果配置为 0 则表示不限制
 	var connMaxLifetimeMinutes int
 	if section.HasKey("conn_max_lifetime_minutes") {
@@ -711,14 +736,14 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	} else {
 		connMaxLifetimeMinutes = 30 // 大表场景默认 30 分钟
 	}
-	
+
 	// 查询超时配置（秒），0 表示使用默认值（30分钟）
 	queryTimeoutSeconds := section.Key("query_timeout_seconds").MustInt(0)
-	
+
 	// 读写超时配置（秒），0 表示使用默认值
 	readTimeoutSeconds := section.Key("read_timeout_seconds").MustInt(0)
 	writeTimeoutSeconds := section.Key("write_timeout_seconds").MustInt(0)
-	
+
 	// 查询重试次数（针对大表查询失败场景）
 	maxRetries := section.Key("max_retries").MustInt(2)
 	if maxRetries < 0 {
@@ -727,7 +752,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	if maxRetries > 5 {
 		maxRetries = 5 // 最多重试 5 次
 	}
-	
+
 	if maxOpenConns < 1 {
 		// 如果配置为 0 或负数，使用自动计算值
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
@@ -747,9 +772,9 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	// 设置连接池配置
 	d.setConnectionPoolConfig(maxOpenConns, maxIdleConns, connMaxLifetimeMinutes, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds)
 	d.maxRetries = maxRetries
-	
+
 	// 输出连接池配置信息（帮助用户了解实际配置）
-	info(fmt.Sprintf("连接池配置：max_open_conns=%d, max_idle_conns=%d, conn_max_lifetime=%d分钟", 
+	info(fmt.Sprintf("连接池配置：max_open_conns=%d, max_idle_conns=%d, conn_max_lifetime=%d分钟",
 		maxOpenConns, maxIdleConns, connMaxLifetimeMinutes))
 	info(fmt.Sprintf("并发配置：数据库级别=%d, 表级别=%d, 查询重试次数=%d", concurrency, tableConcurrency, maxRetries))
 
@@ -806,7 +831,19 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		errorLog(fmt.Sprintf("连接源库失败：%v", err))
 		return ""
 	}
-	defer srcDB.Close()
+	defer func() {
+		// 使用 goroutine 和超时来关闭连接，避免阻塞
+		done := make(chan struct{})
+		go func() {
+			srcDB.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			// 5秒超时后强制退出，避免无限等待
+		}
+	}()
 
 	var dbs []string
 	dbSet := make(map[string]bool)
@@ -832,7 +869,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		errorLog("未找到匹配的数据库")
 		return ""
 	}
-	
+
 	info(fmt.Sprintf("找到 %d 个数据库需要校验", len(dbs)))
 
 	// Schema object counts comparison
@@ -841,13 +878,37 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		if err != nil {
 			errorLog(fmt.Sprintf("连接源库失败：%v", err))
 		} else {
-			defer srcDB2.Close()
+			defer func() {
+				// 使用 goroutine 和超时来关闭连接，避免阻塞
+				done := make(chan struct{})
+				go func() {
+					srcDB2.Close()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					// 5秒超时后强制退出，避免无限等待
+				}
+			}()
 
 			dstDB2, err := d.getConnection(dst)
 			if err != nil {
 				errorLog(fmt.Sprintf("连接目标库失败：%v", err))
 			} else {
-				defer dstDB2.Close()
+				defer func() {
+					// 使用 goroutine 和超时来关闭连接，避免阻塞
+					done := make(chan struct{})
+					go func() {
+						dstDB2.Close()
+						close(done)
+					}()
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						// 5秒超时后强制退出，避免无限等待
+					}
+				}()
 
 				if srcSnapshotTS != "" {
 					snapshotVal, err := strconv.ParseInt(srcSnapshotTS, 10, 64)
@@ -966,7 +1027,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					processedDBs++
 					currentProgress := processedDBs
 					mu.Unlock()
-					
+
 					info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", currentProgress, totalDBs, dbName))
 
 					var srcTS, dstTS *string
@@ -987,7 +1048,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			}
 			wg.Wait()
 		}
-		
+
 		// 输出性能统计
 		elapsed := time.Since(startTime)
 		totalTables := len(allRows)

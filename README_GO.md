@@ -96,9 +96,11 @@ max_idle_conns = 0
 # Set to 0 for unlimited (not recommended)
 conn_max_lifetime_minutes = 30
 
-# query_timeout_seconds: Query timeout (seconds), 0 means default (30 minutes)
+# query_timeout_seconds: Query timeout (seconds), 0 means default (10 minutes)
 # For large table COUNT(1) queries, adjust based on table size
 # Examples: 10M rows: 600-1800s (10-30min), 100M rows: 1800-3600s (30-60min)
+# Set to 0 to use default 10 minutes timeout (avoids program hanging due to long queries)
+# 【Important】Recommend explicitly setting this value based on largest table size, avoid using default
 query_timeout_seconds = 0
 
 # read_timeout_seconds: Read timeout (seconds), 0 means default
@@ -260,7 +262,8 @@ max_retries = 2
 #### Timeout Configuration (optimized for large table queries)
 
 - `query_timeout_seconds`: Query timeout (seconds)
-  - Default: 0 (uses default 30 minutes)
+  - Default: 0 (uses default 10 minutes, avoids program hanging due to long queries)
+  - **【Important】**Recommend explicitly setting this value based on largest table size, avoid using default
   - Recommendations based on table size:
     - 10M rows: 600-1800 seconds (10-30 minutes)
     - 100M rows: 1800-3600 seconds (30-60 minutes)
@@ -367,8 +370,13 @@ max_retries = 3
 - **Quick check**: Set `use_stats = true` to use statistics mode
 - **Connection pool**: Recommended to use auto-calculation (set to 0), tool will auto-optimize based on concurrency settings
 - **Large table queries**: Set `query_timeout_seconds` based on largest table size to ensure sufficient time
+  - **【Important】**Recommend explicitly setting this value, avoid using default (10 minutes), especially for very large tables
+  - If tables are very large, recommend setting to 1800-3600 seconds (30-60 minutes)
 - **Unstable network**: Increase `max_retries` to 3-5 for better success rate
 - **Monitoring and debugging**: Observe connection pool configuration and performance statistics in console output, adjust based on actual situation
+- **Program hanging issues**: If program hangs after completing all work, it may be waiting for database connections to close
+  - Tool has added connection close timeout mechanism (5 seconds) to handle this automatically
+  - If problem persists, check if query timeout is set too long, recommend explicitly setting `query_timeout_seconds`
 
 ## Features
 
