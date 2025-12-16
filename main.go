@@ -160,11 +160,31 @@ type SchemaObjectCounts struct {
 	Views   map[string]int
 }
 
-func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB) (*SchemaObjectCounts, error) {
+func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*SchemaObjectCounts, error) {
 	result := &SchemaObjectCounts{
 		Tables:  make(map[string]int),
 		Indexes: make(map[string]int),
 		Views:   make(map[string]int),
+	}
+
+	// 获取连接并在连接上设置 snapshot，然后在该连接上执行所有查询
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	// 在当前连接上设置 snapshot（如果提供）
+	if snapshotTS != nil && *snapshotTS != "" {
+		snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("无效的 snapshot_ts 值: %s, 错误: %v", *snapshotTS, parseErr)
+		}
+		_, setErr := conn.ExecContext(ctx, "SET @@tidb_snapshot=?", snapshotVal)
+		if setErr != nil {
+			return nil, fmt.Errorf("设置 snapshot_ts 失败: %v", setErr)
+		}
 	}
 
 	// Count tables
@@ -174,7 +194,7 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB) (*SchemaObjectCounts, err
 		WHERE t.TABLE_TYPE = 'BASE TABLE'
 		GROUP BY t.TABLE_SCHEMA
 	`
-	rows, err := db.Query(tableSQL)
+	rows, err := conn.QueryContext(ctx, tableSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +215,7 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB) (*SchemaObjectCounts, err
 		FROM INFORMATION_SCHEMA.TIDB_INDEXES
 		GROUP BY TABLE_SCHEMA
 	`
-	rows, err = db.Query(indexSQL)
+	rows, err = conn.QueryContext(ctx, indexSQL)
 	if err != nil {
 		info(fmt.Sprintf("查询 INFORMATION_SCHEMA.TIDB_INDEXES 失败，可能不是 TiDB 集群：%v", err))
 	} else {
@@ -218,7 +238,7 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB) (*SchemaObjectCounts, err
 		WHERE t.TABLE_TYPE = 'VIEW'
 		GROUP BY t.TABLE_SCHEMA
 	`
-	rows, err = db.Query(viewSQL)
+	rows, err = conn.QueryContext(ctx, viewSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -349,34 +369,7 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		}
 	}()
 
-	// Set snapshot timestamps if provided
-	if srcSnapshotTS != nil && *srcSnapshotTS != "" {
-		snapshotVal, err := strconv.ParseInt(*srcSnapshotTS, 10, 64)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("无效的 snapshot_ts 值: %s, 错误: %v", *srcSnapshotTS, err))
-			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-		}
-		_, err = srcDB.Exec("SET @@tidb_snapshot=?", snapshotVal)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("设置源库 snapshot_ts 失败：%v", err))
-			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-		}
-	}
-
-	if dstSnapshotTS != nil && *dstSnapshotTS != "" {
-		snapshotVal, err := strconv.ParseInt(*dstSnapshotTS, 10, 64)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("无效的 snapshot_ts 值: %s, 错误: %v", *dstSnapshotTS, err))
-			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-		}
-		_, err = dstDB.Exec("SET @@tidb_snapshot=?", snapshotVal)
-		if err != nil {
-			errList = append(errList, fmt.Sprintf("设置目标库 snapshot_ts 失败：%v", err))
-			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-		}
-	}
-
-	// Get table lists
+	// Get table lists (snapshot will be set in each goroutine's connection)
 	srcTables, err := d.getTableList(srcDB, db)
 	if err != nil {
 		errList = append(errList, fmt.Sprintf("获取源库表列表失败：%v", err))
@@ -426,7 +419,7 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 
 		go func() {
 			defer statsWg.Done()
-			srcData, srcErr = d.getTableRowCountsFromStats(srcDB, db, srcTables)
+			srcData, srcErr = d.getTableRowCountsFromStats(srcDB, db, srcTables, srcSnapshotTS)
 			if srcErr != nil {
 				errList = append(errList, fmt.Sprintf("从统计信息获取源库行数失败：%v", srcErr))
 			}
@@ -434,7 +427,7 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 
 		go func() {
 			defer statsWg.Done()
-			dstData, dstErr = d.getTableRowCountsFromStats(dstDB, db, dstTables)
+			dstData, dstErr = d.getTableRowCountsFromStats(dstDB, db, dstTables, dstSnapshotTS)
 			if dstErr != nil {
 				errList = append(errList, fmt.Sprintf("从统计信息获取目标库行数失败：%v", dstErr))
 			}
@@ -458,7 +451,7 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		// 并发统计源库所有表的行数
 		go func() {
 			defer countWg.Done()
-			srcData, srcErrList = d.countTableRowsConcurrent(srcDB, db, srcTables, tableConcurrency)
+			srcData, srcErrList = d.countTableRowsConcurrent(srcDB, db, srcTables, tableConcurrency, srcSnapshotTS)
 			for _, err := range srcErrList {
 				errList = append(errList, err.Error())
 			}
@@ -467,7 +460,7 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		// 并发统计目标库所有表的行数
 		go func() {
 			defer countWg.Done()
-			dstData, dstErrList = d.countTableRowsConcurrent(dstDB, db, dstTables, tableConcurrency)
+			dstData, dstErrList = d.countTableRowsConcurrent(dstDB, db, dstTables, tableConcurrency, dstSnapshotTS)
 			for _, err := range dstErrList {
 				errList = append(errList, err.Error())
 			}
@@ -543,7 +536,7 @@ func (d *DBDataDiff) removeIgnoredTables(tables []string, ignoreTables []string)
 }
 
 // countTableRowsConcurrent 表级别并发统计：对每个表并发执行 COUNT(1)
-func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables []string, concurrency int) (map[string]int64, []error) {
+func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables []string, concurrency int, snapshotTS *string) (map[string]int64, []error) {
 	result := make(map[string]int64)
 	var errList []error
 	var mu sync.Mutex
@@ -589,10 +582,46 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 					// 避免查询时间过长导致程序卡住
 					ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
 				}
-				// 注意：cancel 必须在查询完成后立即调用，不能 defer 到函数结束
-				// 因为如果查询成功，需要立即取消 context 释放资源
-				err = db.QueryRowContext(ctx, query).Scan(&count)
-				cancel() // 立即取消 context，释放资源
+
+				// 每个 goroutine 获取连接后，在自己的连接上设置 snapshot
+				conn, connErr := db.Conn(ctx)
+				if connErr != nil {
+					cancel()
+					err = connErr
+					if retry == d.maxRetries {
+						break
+					}
+					continue
+				}
+
+				// 在当前连接上设置 snapshot（如果提供）
+				if snapshotTS != nil && *snapshotTS != "" {
+					snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
+					if parseErr != nil {
+						conn.Close()
+						cancel()
+						err = fmt.Errorf("无效的 snapshot_ts 值: %s, 错误: %v", *snapshotTS, parseErr)
+						if retry == d.maxRetries {
+							break
+						}
+						continue
+					}
+					_, setErr := conn.ExecContext(ctx, "SET @@tidb_snapshot=?", snapshotVal)
+					if setErr != nil {
+						conn.Close()
+						cancel()
+						err = fmt.Errorf("设置 snapshot_ts 失败: %v", setErr)
+						if retry == d.maxRetries {
+							break
+						}
+						continue
+					}
+				}
+
+				// 使用当前连接执行查询
+				err = conn.QueryRowContext(ctx, query).Scan(&count)
+				conn.Close() // 返回连接到连接池
+				cancel()     // 立即取消 context，释放资源
 
 				if err == nil {
 					break // 成功，退出重试循环
@@ -636,7 +665,7 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 }
 
 // getTableRowCountsFromStats 使用统计信息快速获取表行数（近似值，但非常快）
-func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, tables []string) (map[string]int64, error) {
+func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, tables []string, snapshotTS *string) (map[string]int64, error) {
 	result := make(map[string]int64)
 
 	if len(tables) == 0 {
@@ -662,8 +691,28 @@ func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, table
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (%s)
 	`, strings.Join(placeholders, ","))
 
+	// 获取连接并在连接上设置 snapshot
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	// 在当前连接上设置 snapshot（如果提供）
+	if snapshotTS != nil && *snapshotTS != "" {
+		snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("无效的 snapshot_ts 值: %s, 错误: %v", *snapshotTS, parseErr)
+		}
+		_, setErr := conn.ExecContext(ctx, "SET @@tidb_snapshot=?", snapshotVal)
+		if setErr != nil {
+			return nil, fmt.Errorf("设置 snapshot_ts 失败: %v", setErr)
+		}
+	}
+
 	args = append([]interface{}{schema}, args...)
-	rows, err := db.Query(query, args...)
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -936,35 +985,20 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					}
 				}()
 
+				// snapshot will be set in getSchemaObjectCounts for each connection
+				var srcSnapshotTSPtr, dstSnapshotTSPtr *string
 				if srcSnapshotTS != "" {
-					snapshotVal, err := strconv.ParseInt(srcSnapshotTS, 10, 64)
-					if err != nil {
-						errorLog(fmt.Sprintf("无效的 snapshot_ts 值: %s, 错误: %v", srcSnapshotTS, err))
-					} else {
-						_, err = srcDB2.Exec("SET @@tidb_snapshot=?", snapshotVal)
-						if err != nil {
-							errorLog(fmt.Sprintf("设置源库 snapshot_ts 失败：%v", err))
-						}
-					}
+					srcSnapshotTSPtr = &srcSnapshotTS
 				}
-
 				if dstSnapshotTS != "" {
-					snapshotVal, err := strconv.ParseInt(dstSnapshotTS, 10, 64)
-					if err != nil {
-						errorLog(fmt.Sprintf("无效的 snapshot_ts 值: %s, 错误: %v", dstSnapshotTS, err))
-					} else {
-						_, err = dstDB2.Exec("SET @@tidb_snapshot=?", snapshotVal)
-						if err != nil {
-							errorLog(fmt.Sprintf("设置目标库 snapshot_ts 失败：%v", err))
-						}
-					}
+					dstSnapshotTSPtr = &dstSnapshotTS
 				}
 
-				srcCounts, err := d.getSchemaObjectCounts(srcDB2)
+				srcCounts, err := d.getSchemaObjectCounts(srcDB2, srcSnapshotTSPtr)
 				if err != nil {
 					errorLog(fmt.Sprintf("统计源库对象数量失败：%v", err))
 				} else {
-					dstCounts, err := d.getSchemaObjectCounts(dstDB2)
+					dstCounts, err := d.getSchemaObjectCounts(dstDB2, dstSnapshotTSPtr)
 					if err != nil {
 						errorLog(fmt.Sprintf("统计目标库对象数量失败：%v", err))
 					} else {
