@@ -30,6 +30,28 @@ func errorLog(msg string) {
 	logger.Printf("[ERROR] %s\n", msg)
 }
 
+const defaultDBCloseTimeout = 5 * time.Second
+
+// closeDBWithTimeout 关闭 *sql.DB，避免 driver/网络异常导致 Close() 阻塞不退出。
+func closeDBWithTimeout(db *sql.DB, label string) {
+	if db == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = db.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(defaultDBCloseTimeout):
+		if label == "" {
+			label = "数据库"
+		}
+		errorLog(fmt.Sprintf("关闭%s连接超时，强制退出", label))
+	}
+}
+
 type DBDataDiff struct {
 	maxOpenConns        int
 	maxIdleConns        int
@@ -37,22 +59,20 @@ type DBDataDiff struct {
 	queryTimeoutSeconds int
 	readTimeoutSeconds  int
 	writeTimeoutSeconds int
-	maxRetries          int // 查询重试次数
+	maxRetries          int
 }
 
-// setConnectionPoolConfig 设置连接池配置（从配置文件读取）
 func (d *DBDataDiff) setConnectionPoolConfig(maxOpenConns, maxIdleConns int, connMaxLifetimeMinutes int, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds int) {
 	d.maxOpenConns = maxOpenConns
 	d.maxIdleConns = maxIdleConns
 	if connMaxLifetimeMinutes > 0 {
 		d.connMaxLifetime = time.Duration(connMaxLifetimeMinutes) * time.Minute
 	} else {
-		d.connMaxLifetime = 0 // 0 表示不限制
+		d.connMaxLifetime = 0
 	}
 	d.queryTimeoutSeconds = queryTimeoutSeconds
 	d.readTimeoutSeconds = readTimeoutSeconds
 	d.writeTimeoutSeconds = writeTimeoutSeconds
-	// maxRetries 在 diff 函数中单独设置
 }
 
 func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
@@ -85,21 +105,18 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 
 	password, _ := parsed.User.Password()
 
-	// 构建 DSN，针对大表场景优化参数
 	dsnParams := []string{
 		"charset=utf8mb4",
 		"parseTime=True",
 		"loc=Local",
 	}
 
-	// 添加超时参数（针对大表查询优化）
 	if d.readTimeoutSeconds > 0 {
 		dsnParams = append(dsnParams, fmt.Sprintf("readTimeout=%ds", d.readTimeoutSeconds))
 	}
 	if d.writeTimeoutSeconds > 0 {
 		dsnParams = append(dsnParams, fmt.Sprintf("writeTimeout=%ds", d.writeTimeoutSeconds))
 	}
-	// 对于大表，增加连接超时时间
 	dsnParams = append(dsnParams, "timeout=30s")
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/?%s",
@@ -110,30 +127,25 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 		return nil, fmt.Errorf("连接数据库失败: %v", err)
 	}
 
-	// 应用连接池配置（如果已设置，否则使用针对大表的默认值）
 	if d.maxOpenConns > 0 {
 		db.SetMaxOpenConns(d.maxOpenConns)
 	} else {
-		db.SetMaxOpenConns(100) // 大表场景默认值：100
+		db.SetMaxOpenConns(100)
 	}
 
 	if d.maxIdleConns > 0 {
 		db.SetMaxIdleConns(d.maxIdleConns)
 	} else {
-		db.SetMaxIdleConns(80) // 大表场景默认值：80
+		db.SetMaxIdleConns(80)
 	}
 
-	// 连接最大生存时间：如果配置为 0 表示不限制，否则使用配置值
-	// 注意：如果 connMaxLifetime 为 0，表示配置为不限制，不调用 SetConnMaxLifetime
 	if d.connMaxLifetime > 0 {
 		db.SetConnMaxLifetime(d.connMaxLifetime)
 	}
-	// 如果 connMaxLifetime 被显式设置为 0（通过配置），则不设置（表示不限制）
 
 	return db, nil
 }
 
-// setSnapshotOnConn 在连接上设置 snapshot（支持 context）
 func (d *DBDataDiff) setSnapshotOnConn(ctx context.Context, conn *sql.Conn, snapshotTS *string) error {
 	if snapshotTS != nil && *snapshotTS != "" {
 		snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
@@ -148,7 +160,6 @@ func (d *DBDataDiff) setSnapshotOnConn(ctx context.Context, conn *sql.Conn, snap
 	return nil
 }
 
-// diffSortedStrings 返回两个已排序字符串切片的差集：onlyA 表示只在 a 中，onlyB 表示只在 b 中
 func diffSortedStrings(a, b []string) (onlyA, onlyB []string) {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
@@ -175,7 +186,6 @@ func diffSortedStrings(a, b []string) (onlyA, onlyB []string) {
 }
 
 func (d *DBDataDiff) getDBList(db *sql.DB, dbPattern string, snapshotTS *string) ([]string, error) {
-	// 获取连接并在连接上设置 snapshot
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -183,15 +193,17 @@ func (d *DBDataDiff) getDBList(db *sql.DB, dbPattern string, snapshotTS *string)
 	}
 	defer conn.Close()
 
-	// 在当前连接上设置 snapshot（如果提供）
 	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
 		return nil, err
 	}
 
-	// Escape % for SQL LIKE pattern (same as Python: db_pattern.replace("%", "%%"))
-	escapedPattern := strings.ReplaceAll(dbPattern, "%", "%%")
-	query := "SELECT SCHEMA_NAME AS db_name FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE ?"
-	rows, err := conn.QueryContext(ctx, query, escapedPattern)
+	pattern := strings.TrimSpace(dbPattern)
+	if pattern == "" {
+		return []string{}, nil
+	}
+	// LIKE pattern: 直接按用户输入传入（例如 test%），不要把 % 替换成 %%（那是 fmt.Sprintf 场景）。
+	query := "SELECT SCHEMA_NAME AS db_name FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME"
+	rows, err := conn.QueryContext(ctx, query, pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +233,6 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*Sch
 		Views:   make(map[string]int),
 	}
 
-	// 获取连接并在连接上设置 snapshot，然后在该连接上执行所有查询
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -229,12 +240,10 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*Sch
 	}
 	defer conn.Close()
 
-	// 在当前连接上设置 snapshot（如果提供）
 	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
 		return nil, err
 	}
 
-	// Count tables
 	tableSQL := `
 		SELECT t.TABLE_SCHEMA, COUNT(*) AS sum
 		FROM INFORMATION_SCHEMA.TABLES t
@@ -256,7 +265,6 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*Sch
 	}
 	rows.Close()
 
-	// Count indexes (TiDB specific)
 	indexSQL := `
 		SELECT TABLE_SCHEMA, COUNT(*) AS sum
 		FROM INFORMATION_SCHEMA.TIDB_INDEXES
@@ -278,7 +286,6 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*Sch
 		rows.Close()
 	}
 
-	// Count views
 	viewSQL := `
 		SELECT t.TABLE_SCHEMA, COUNT(*) AS sum
 		FROM INFORMATION_SCHEMA.TABLES t
@@ -364,54 +371,11 @@ type CheckResult struct {
 	RowsForCSV [][]string
 }
 
-func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string) CheckResult {
+func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string) CheckResult {
 	errList := []string{}
 	rowsForCSV := [][]string{}
-	var errListMu sync.Mutex // 保护 errList 的并发访问
+	var errListMu sync.Mutex
 
-	srcDB, err := d.getConnection(src)
-	if err != nil {
-		errList = append(errList, fmt.Sprintf("连接源库失败：%v", err))
-		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-	}
-	defer func() {
-		// 使用 goroutine 和超时来关闭连接，避免阻塞
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			srcDB.Close()
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			// 5秒超时后强制退出，避免无限等待
-			// 记录警告但不阻塞
-			errorLog("关闭源库连接超时，强制退出")
-		}
-	}()
-
-	dstDB, err := d.getConnection(dst)
-	if err != nil {
-		errList = append(errList, fmt.Sprintf("连接目标库失败：%v", err))
-		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-	}
-	defer func() {
-		// 使用 goroutine 和超时来关闭连接，避免阻塞
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			dstDB.Close()
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			// 5秒超时后强制退出，避免无限等待
-			// 记录警告但不阻塞
-			errorLog("关闭目标库连接超时，强制退出")
-		}
-	}()
-
-	// Get table lists (snapshot will be set in getTableList if provided)
 	srcTables, err := d.getTableList(srcDB, db, srcSnapshotTS)
 	if err != nil {
 		errList = append(errList, fmt.Sprintf("获取源库表列表失败：%v", err))
@@ -424,24 +388,19 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 	}
 
-	// Remove ignored tables
 	srcTables = d.removeIgnoredTables(srcTables, ignoreTables)
 	dstTables = d.removeIgnoredTables(dstTables, ignoreTables)
 
-	// 表数量一致也需要校验表名集合是否一致（避免后续统计/COUNT 白跑）
-	// 依赖 getTableList 已排序 + removeIgnoredTables 保持顺序
 	onlySrc, onlyDst := diffSortedStrings(srcTables, dstTables)
 	if len(onlySrc) > 0 || len(onlyDst) > 0 {
 		msg := fmt.Sprintf("【%s】源库和目标库表清单不一致，校验异常退出！src_only=%v, dst_only=%v", db, onlySrc, onlyDst)
 		errorLog(msg)
 		errList = append(errList, msg)
 		for _, t := range onlySrc {
-			// 目的端缺表
 			errList = append(errList, t)
 			rowsForCSV = append(rowsForCSV, []string{db, t, "-1", "-1", "N/A", "目的表不存在"})
 		}
 		for _, t := range onlyDst {
-			// 源端缺表
 			errList = append(errList, t)
 			rowsForCSV = append(rowsForCSV, []string{db, t, "-1", "-1", "N/A", "源表不存在"})
 		}
@@ -472,7 +431,6 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 	dstRet := make(map[string]int64)
 
 	if useStats {
-		// 使用统计信息快速获取（一次性获取所有表，并行执行）
 		var statsWg sync.WaitGroup
 		var srcData map[string]int64
 		var dstData map[string]int64
@@ -507,14 +465,11 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 			dstRet = dstData
 		}
 	} else {
-		// 使用精确 COUNT（表级别并发：每个表独立并发统计）
-		// 并行执行源库和目标库的表级别统计
 		var countWg sync.WaitGroup
 		var srcData, dstData map[string]int64
 		var srcErrList, dstErrList []error
 		countWg.Add(2)
 
-		// 并发统计源库所有表的行数
 		go func() {
 			defer countWg.Done()
 			srcData, srcErrList = d.countTableRowsConcurrent(srcDB, db, srcTables, tableConcurrency, srcSnapshotTS)
@@ -525,7 +480,6 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 			}
 		}()
 
-		// 并发统计目标库所有表的行数
 		go func() {
 			defer countWg.Done()
 			dstData, dstErrList = d.countTableRowsConcurrent(dstDB, db, dstTables, tableConcurrency, dstSnapshotTS)
@@ -545,8 +499,6 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 		}
 	}
 
-	// Compare results
-	// 首先检查源库中的所有表
 	for tableName, srcCount := range srcRet {
 		dstCount, exists := dstRet[tableName]
 		if !exists {
@@ -581,7 +533,6 @@ func (d *DBDataDiff) checkSingleDB(db, src, dst string, ignoreTables []string, t
 }
 
 func (d *DBDataDiff) getTableList(db *sql.DB, schema string, snapshotTS *string) ([]string, error) {
-	// 获取连接并在连接上设置 snapshot
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -589,12 +540,12 @@ func (d *DBDataDiff) getTableList(db *sql.DB, schema string, snapshotTS *string)
 	}
 	defer conn.Close()
 
-	// 在当前连接上设置 snapshot（如果提供）
 	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
 		return nil, err
 	}
 
-	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = ?"
+	// 只返回 BASE TABLE，避免把 VIEW 也纳入逐表 COUNT 导致报错/结果不准。
+	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name"
 	rows, err := conn.QueryContext(ctx, query, schema)
 	if err != nil {
 		return nil, err
@@ -628,7 +579,6 @@ func (d *DBDataDiff) removeIgnoredTables(tables []string, ignoreTables []string)
 	return result
 }
 
-// countTableRowsConcurrent 表级别并发统计：对每个表并发执行 COUNT(1)
 func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables []string, concurrency int, snapshotTS *string) (map[string]int64, []error) {
 	result := make(map[string]int64)
 	var errList []error
@@ -637,114 +587,123 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 	if len(tables) == 0 {
 		return result, errList
 	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
 	totalTables := len(tables)
 	processedTables := 0
 
-	// 使用 channel 控制并发数
-	semaphore := make(chan struct{}, concurrency)
+	jobs := make(chan string)
 	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			const connAcquireTimeout = 30 * time.Second
+			var conn *sql.Conn
+			defer func() {
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}()
+
+			ensureConn := func() error {
+				if conn != nil {
+					return nil
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), connAcquireTimeout)
+				defer cancel()
+				c, err := db.Conn(ctx)
+				if err != nil {
+					return err
+				}
+				if err := d.setSnapshotOnConn(ctx, c, snapshotTS); err != nil {
+					_ = c.Close()
+					return err
+				}
+				conn = c
+				return nil
+			}
+
+			for tblName := range jobs {
+				query := fmt.Sprintf("SELECT COUNT(1) AS cnt FROM `%s`.`%s`", dbName, tblName)
+				var count int64
+				var err error
+
+				for retry := 0; retry <= d.maxRetries; retry++ {
+					if retry > 0 {
+						waitTime := time.Duration(retry) * time.Second
+						time.Sleep(waitTime)
+					}
+
+					if connErr := ensureConn(); connErr != nil {
+						err = connErr
+						if retry == d.maxRetries {
+							break
+						}
+						continue
+					}
+
+					var ctx context.Context
+					var cancel context.CancelFunc
+					if d.queryTimeoutSeconds > 0 {
+						ctx, cancel = context.WithTimeout(context.Background(), time.Duration(d.queryTimeoutSeconds)*time.Second)
+					} else {
+						ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
+					}
+
+					err = conn.QueryRowContext(ctx, query).Scan(&count)
+					cancel()
+
+					if err == nil {
+						break
+					}
+
+					// 出错后主动丢弃连接，避免 session 状态/超时导致后续查询受影响
+					_ = conn.Close()
+					conn = nil
+					if retry == d.maxRetries {
+						break
+					}
+				}
+
+				mu.Lock()
+				processedTables++
+				if err != nil {
+					errList = append(errList, fmt.Errorf("表 %s 统计失败: %v", tblName, err))
+				} else {
+					result[tblName] = count
+				}
+				shouldLog := false
+				if totalTables > 0 {
+					progress := processedTables * 100 / totalTables
+					prevProgress := (processedTables - 1) * 100 / totalTables
+					shouldLog = processedTables%10 == 0 || processedTables == totalTables || progress != prevProgress
+				} else {
+					shouldLog = processedTables%10 == 0 || processedTables == totalTables
+				}
+				if shouldLog && totalTables > 0 {
+					progress := processedTables * 100 / totalTables
+					if progress > 100 {
+						progress = 100
+					}
+					info(fmt.Sprintf("  [%s] 表统计进度: %d/%d (%d%%)", dbName, processedTables, totalTables, progress))
+				}
+				mu.Unlock()
+			}
+		}()
+	}
 
 	for _, table := range tables {
-		wg.Add(1)
-		go func(tblName string) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire
-			defer func() { <-semaphore }() // Release
-
-			// 对单个表执行 COUNT(1)，使用 context 控制超时（针对大表）
-			query := fmt.Sprintf("SELECT COUNT(1) AS cnt FROM `%s`.`%s`", dbName, tblName)
-			var count int64
-			var err error
-
-			// 重试机制（针对大表查询失败场景）
-			for retry := 0; retry <= d.maxRetries; retry++ {
-				if retry > 0 {
-					// 重试前等待，指数退避
-					waitTime := time.Duration(retry) * time.Second
-					time.Sleep(waitTime)
-				}
-
-				// 如果配置了查询超时，使用 context 控制
-				var ctx context.Context
-				var cancel context.CancelFunc
-				if d.queryTimeoutSeconds > 0 {
-					ctx, cancel = context.WithTimeout(context.Background(), time.Duration(d.queryTimeoutSeconds)*time.Second)
-				} else {
-					// 默认超时：大表可能需要较长时间，但设置一个合理的上限（10分钟）
-					// 避免查询时间过长导致程序卡住
-					ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
-				}
-
-				// 每个 goroutine 获取连接后，在自己的连接上设置 snapshot
-				conn, connErr := db.Conn(ctx)
-				if connErr != nil {
-					cancel()
-					err = connErr
-					if retry == d.maxRetries {
-						break
-					}
-					continue
-				}
-
-				// 在当前连接上设置 snapshot（如果提供）
-				if setErr := d.setSnapshotOnConn(ctx, conn, snapshotTS); setErr != nil {
-					conn.Close()
-					cancel()
-					err = setErr
-					if retry == d.maxRetries {
-						break
-					}
-					continue
-				}
-
-				// 使用当前连接执行查询
-				err = conn.QueryRowContext(ctx, query).Scan(&count)
-				conn.Close() // 返回连接到连接池
-				cancel()     // 立即取消 context，释放资源
-
-				if err == nil {
-					break // 成功，退出重试循环
-				}
-
-				// 如果是最后一次重试，记录错误
-				if retry == d.maxRetries {
-					break
-				}
-			}
-
-			mu.Lock()
-			processedTables++
-			if err != nil {
-				errList = append(errList, fmt.Errorf("表 %s 统计失败: %v", tblName, err))
-			} else {
-				result[tblName] = count
-			}
-			// 每处理 10% 的表或每 10 张表输出一次进度（针对大量表场景）
-			shouldLog := false
-			if totalTables > 0 {
-				progress := processedTables * 100 / totalTables
-				prevProgress := (processedTables - 1) * 100 / totalTables
-				shouldLog = processedTables%10 == 0 || processedTables == totalTables || progress != prevProgress
-			} else {
-				shouldLog = processedTables%10 == 0 || processedTables == totalTables
-			}
-			if shouldLog && totalTables > 0 {
-				progress := processedTables * 100 / totalTables
-				if progress > 100 {
-					progress = 100
-				}
-				info(fmt.Sprintf("  [%s] 表统计进度: %d/%d (%d%%)", dbName, processedTables, totalTables, progress))
-			}
-			mu.Unlock()
-		}(table)
+		jobs <- table
 	}
+	close(jobs)
 
 	wg.Wait()
 	return result, errList
 }
 
-// getTableRowCountsFromStats 使用统计信息快速获取表行数（近似值，但非常快）
 func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, tables []string, snapshotTS *string) (map[string]int64, error) {
 	result := make(map[string]int64)
 
@@ -752,26 +711,10 @@ func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, table
 		return result, nil
 	}
 
-	// 初始化所有表为 0，确保即使统计信息中没有也能返回
 	for _, table := range tables {
 		result[table] = 0
 	}
 
-	// 构建 IN 子句的占位符
-	placeholders := make([]string, len(tables))
-	args := make([]interface{}, len(tables))
-	for i, table := range tables {
-		placeholders[i] = "?"
-		args[i] = table
-	}
-
-	query := fmt.Sprintf(`
-		SELECT TABLE_NAME, TABLE_ROWS 
-		FROM INFORMATION_SCHEMA.TABLES 
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (%s)
-	`, strings.Join(placeholders, ","))
-
-	// 获取连接并在连接上设置 snapshot
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -779,109 +722,121 @@ func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, table
 	}
 	defer conn.Close()
 
-	// 在当前连接上设置 snapshot（如果提供）
 	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
 		return nil, err
 	}
 
-	args = append([]interface{}{schema}, args...)
-	rows, err := conn.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	// 分批构造 IN 子句，避免表数量过多导致 SQL 太长/占位符超限。
+	const maxInClauseItems = 500
+	for start := 0; start < len(tables); start += maxInClauseItems {
+		end := start + maxInClauseItems
+		if end > len(tables) {
+			end = len(tables)
+		}
+		batch := tables[start:end]
+		if len(batch) == 0 {
+			continue
+		}
 
-	for rows.Next() {
-		var tableName string
-		var rowCount sql.NullInt64
-		if err := rows.Scan(&tableName, &rowCount); err != nil {
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)+1)
+		args = append(args, schema)
+		for i, table := range batch {
+			placeholders[i] = "?"
+			args = append(args, table)
+		}
+
+		query := fmt.Sprintf(
+			"SELECT TABLE_NAME, TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
 			return nil, err
 		}
-		if rowCount.Valid {
-			result[tableName] = rowCount.Int64
-		} else {
-			result[tableName] = 0
+		for rows.Next() {
+			var tableName string
+			var rowCount sql.NullInt64
+			if err := rows.Scan(&tableName, &rowCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if rowCount.Valid {
+				result[tableName] = rowCount.Int64
+			} else {
+				result[tableName] = 0
+			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 
-	return result, rows.Err()
+	return result, nil
 }
 
 func (d *DBDataDiff) diff(conf *ini.File) string {
 	section := conf.Section("diff")
 
 	threshold := section.Key("threshold").MustInt(0)
-	// 数据库级别并发数（同时处理多个数据库）
-	// 多库场景默认值：5（针对多库场景优化，可根据实际情况调整）
 	concurrency := section.Key("concurrency").MustInt(5)
 	if concurrency < 1 {
 		concurrency = 5
 	}
 
-	// 是否使用统计信息快速获取行数（默认 true，速度快但可能不够精确）
 	useStats := section.Key("use_stats").MustBool(true)
 
-	// 表级别并发数（每个表独立并发统计时的并发数）
-	// 多库多表场景默认值：30（针对大量表优化）
 	tableConcurrency := section.Key("table_concurrency").MustInt(30)
 	if tableConcurrency < 1 {
 		tableConcurrency = 30
 	}
 
-	// 连接池配置（针对多库多表大表场景优化）
-	// 动态计算：每个数据库需要 2 个连接池（源+目标），每个连接池需要支持 table_concurrency 并发
-	// 公式：max_open_conns = concurrency * 2 * (table_concurrency + 缓冲)
-	// 默认值：如果未配置，根据并发数自动计算
 	var maxOpenConns, maxIdleConns int
 	if section.HasKey("max_open_conns") {
 		maxOpenConns = section.Key("max_open_conns").MustInt(0)
 	} else {
-		// 自动计算：concurrency * 2（源+目标） * (table_concurrency + 10缓冲)
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
 		if maxOpenConns < 100 {
-			maxOpenConns = 100 // 最小 100
+			maxOpenConns = 100
 		}
 		if maxOpenConns > 500 {
-			maxOpenConns = 500 // 最大 500，避免过多连接
+			maxOpenConns = 500
 		}
 	}
 
 	if section.HasKey("max_idle_conns") {
 		maxIdleConns = section.Key("max_idle_conns").MustInt(0)
 	} else {
-		// 自动计算：max_open_conns 的 80%
 		maxIdleConns = int(float64(maxOpenConns) * 0.8)
 		if maxIdleConns < 80 {
-			maxIdleConns = 80 // 最小 80
+			maxIdleConns = 80
 		}
 	}
 
-	// 处理 conn_max_lifetime_minutes：如果未配置则使用默认值 30（大表查询可能需要更长时间），如果配置为 0 则表示不限制
 	var connMaxLifetimeMinutes int
 	if section.HasKey("conn_max_lifetime_minutes") {
 		connMaxLifetimeMinutes = section.Key("conn_max_lifetime_minutes").MustInt(0)
 	} else {
-		connMaxLifetimeMinutes = 30 // 大表场景默认 30 分钟
+		connMaxLifetimeMinutes = 30
 	}
 
-	// 查询超时配置（秒），0 表示使用默认值（30分钟）
 	queryTimeoutSeconds := section.Key("query_timeout_seconds").MustInt(0)
 
-	// 读写超时配置（秒），0 表示使用默认值
 	readTimeoutSeconds := section.Key("read_timeout_seconds").MustInt(0)
 	writeTimeoutSeconds := section.Key("write_timeout_seconds").MustInt(0)
 
-	// 查询重试次数（针对大表查询失败场景）
 	maxRetries := section.Key("max_retries").MustInt(2)
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
 	if maxRetries > 5 {
-		maxRetries = 5 // 最多重试 5 次
+		maxRetries = 5
 	}
 
 	if maxOpenConns < 1 {
-		// 如果配置为 0 或负数，使用自动计算值
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
 		if maxOpenConns < 100 {
 			maxOpenConns = 100
@@ -896,11 +851,9 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			maxIdleConns = 80
 		}
 	}
-	// 设置连接池配置
 	d.setConnectionPoolConfig(maxOpenConns, maxIdleConns, connMaxLifetimeMinutes, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds)
 	d.maxRetries = maxRetries
 
-	// 输出连接池配置信息（帮助用户了解实际配置）
 	info(fmt.Sprintf("连接池配置：max_open_conns=%d, max_idle_conns=%d, conn_max_lifetime=%d分钟",
 		maxOpenConns, maxIdleConns, connMaxLifetimeMinutes))
 	info(fmt.Sprintf("并发配置：数据库级别=%d, 表级别=%d, 查询重试次数=%d", concurrency, tableConcurrency, maxRetries))
@@ -952,27 +905,19 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		info(fmt.Sprintf("目标库将使用 snapshot_ts: %s", dstSnapshotTS))
 	}
 
-	// Get database list
 	srcDB, err := d.getConnection(src)
 	if err != nil {
 		errorLog(fmt.Sprintf("连接源库失败：%v", err))
 		return ""
 	}
-	defer func() {
-		// 使用 goroutine 和超时来关闭连接，避免阻塞
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			srcDB.Close()
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			// 5秒超时后强制退出，避免无限等待
-			// 记录警告但不阻塞
-			errorLog("关闭源库连接超时，强制退出")
-		}
-	}()
+	defer closeDBWithTimeout(srcDB, "源库")
+
+	dstDB, err := d.getConnection(dst)
+	if err != nil {
+		errorLog(fmt.Sprintf("连接目标库失败：%v", err))
+		return ""
+	}
+	defer closeDBWithTimeout(dstDB, "目标库")
 
 	var dbs []string
 	dbSet := make(map[string]bool)
@@ -1005,97 +950,51 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 
 	info(fmt.Sprintf("找到 %d 个数据库需要校验", len(dbs)))
 
-	// Schema object counts comparison
 	if compareItems["tables"] || compareItems["indexes"] || compareItems["views"] {
-		srcDB2, err := d.getConnection(src)
+		var srcSnapshotTSPtr, dstSnapshotTSPtr *string
+		if srcSnapshotTS != "" {
+			srcSnapshotTSPtr = &srcSnapshotTS
+		}
+		if dstSnapshotTS != "" {
+			dstSnapshotTSPtr = &dstSnapshotTS
+		}
+
+		srcCounts, err := d.getSchemaObjectCounts(srcDB, srcSnapshotTSPtr)
 		if err != nil {
-			errorLog(fmt.Sprintf("连接源库失败：%v", err))
+			errorLog(fmt.Sprintf("统计源库对象数量失败：%v", err))
 		} else {
-			defer func() {
-				// 使用 goroutine 和超时来关闭连接，避免阻塞
-				done := make(chan struct{})
-				go func() {
-					defer close(done)
-					srcDB2.Close()
-				}()
-				select {
-				case <-done:
-				case <-time.After(5 * time.Second):
-					// 5秒超时后强制退出，避免无限等待
-					// 记录警告但不阻塞
-					errorLog("关闭源库连接超时，强制退出")
-				}
-			}()
-
-			dstDB2, err := d.getConnection(dst)
+			dstCounts, err := d.getSchemaObjectCounts(dstDB, dstSnapshotTSPtr)
 			if err != nil {
-				errorLog(fmt.Sprintf("连接目标库失败：%v", err))
+				errorLog(fmt.Sprintf("统计目标库对象数量失败：%v", err))
 			} else {
-				defer func() {
-					// 使用 goroutine 和超时来关闭连接，避免阻塞
-					done := make(chan struct{})
-					go func() {
-						defer close(done)
-						dstDB2.Close()
-					}()
-					select {
-					case <-done:
-					case <-time.After(5 * time.Second):
-						// 5秒超时后强制退出，避免无限等待
-						// 记录警告但不阻塞
-						errorLog("关闭目标库连接超时，强制退出")
+				schemaCompare := d.compareSchemaCounts(srcCounts, dstCounts, threshold)
+
+				info("库级对象数量对比结果：")
+				types := []string{"tables", "indexes", "views"}
+				for _, kind := range types {
+					if !compareItems[kind] {
+						continue
 					}
-				}()
-
-				// snapshot will be set in getSchemaObjectCounts for each connection
-				var srcSnapshotTSPtr, dstSnapshotTSPtr *string
-				if srcSnapshotTS != "" {
-					srcSnapshotTSPtr = &srcSnapshotTS
-				}
-				if dstSnapshotTS != "" {
-					dstSnapshotTSPtr = &dstSnapshotTS
-				}
-
-				srcCounts, err := d.getSchemaObjectCounts(srcDB2, srcSnapshotTSPtr)
-				if err != nil {
-					errorLog(fmt.Sprintf("统计源库对象数量失败：%v", err))
-				} else {
-					dstCounts, err := d.getSchemaObjectCounts(dstDB2, dstSnapshotTSPtr)
-					if err != nil {
-						errorLog(fmt.Sprintf("统计目标库对象数量失败：%v", err))
-					} else {
-						schemaCompare := d.compareSchemaCounts(srcCounts, dstCounts, threshold)
-
-						info("库级对象数量对比结果：")
-						types := []string{"tables", "indexes", "views"}
-						for _, kind := range types {
-							if !compareItems[kind] {
-								continue
-							}
-							info(fmt.Sprintf("== %s ==", kind))
-							// Sort schemas for consistent output
-							schemas := []string{}
-							for schema := range schemaCompare[kind] {
-								schemas = append(schemas, schema)
-							}
-							sort.Strings(schemas)
-							for _, schema := range schemas {
-								val := schemaCompare[kind][schema]
-								status := "一致"
-								if !val.OK {
-									status = "不一致"
-								}
-								info(fmt.Sprintf("schema=%s, src=%d, dst=%d, diff=%d -> %s",
-									schema, val.Src, val.Dst, val.Diff, status))
-							}
+					info(fmt.Sprintf("== %s ==", kind))
+					schemas := []string{}
+					for schema := range schemaCompare[kind] {
+						schemas = append(schemas, schema)
+					}
+					sort.Strings(schemas)
+					for _, schema := range schemas {
+						val := schemaCompare[kind][schema]
+						status := "一致"
+						if !val.OK {
+							status = "不一致"
 						}
+						info(fmt.Sprintf("schema=%s, src=%d, dst=%d, diff=%d -> %s",
+							schema, val.Src, val.Dst, val.Diff, status))
 					}
 				}
 			}
 		}
 	}
 
-	// Row count comparison
 	allRows := [][]string{}
 	errTls := make(map[string][]string)
 
@@ -1115,7 +1014,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		totalDBs := len(dbs)
 
 		if concurrency <= 1 {
-			// Sequential processing
 			for _, db := range dbs {
 				processedDBs++
 				info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", processedDBs, totalDBs, db))
@@ -1126,13 +1024,12 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 				if dstSnapshotTS != "" {
 					dstTS = &dstSnapshotTS
 				}
-				result := d.checkSingleDB(db, src, dst, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
+				result := d.checkSingleDB(db, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
 				errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 				allRows = append(allRows, result.RowsForCSV...)
 				info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", processedDBs, totalDBs, db))
 			}
 		} else {
-			// Concurrent processing
 			info(fmt.Sprintf("使用并发校验，数据库级别并发数：%d", concurrency))
 			var wg sync.WaitGroup
 			var mu sync.Mutex
@@ -1142,8 +1039,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 				wg.Add(1)
 				go func(dbName string) {
 					defer wg.Done()
-					semaphore <- struct{}{}        // Acquire
-					defer func() { <-semaphore }() // Release
+					semaphore <- struct{}{}
+					defer func() { <-semaphore }()
 
 					mu.Lock()
 					processedDBs++
@@ -1159,7 +1056,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					if dstSnapshotTS != "" {
 						dstTS = &dstSnapshotTS
 					}
-					result := d.checkSingleDB(dbName, src, dst, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
+					result := d.checkSingleDB(dbName, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
 
 					mu.Lock()
 					errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
@@ -1171,7 +1068,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			wg.Wait()
 		}
 
-		// 输出性能统计
 		elapsed := time.Since(startTime)
 		totalTables := len(allRows)
 		totalErrors := 0
@@ -1192,7 +1088,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		}
 	}
 
-	// Write CSV
 	if output != "" {
 		file, err := os.Create(output)
 		if err != nil {
@@ -1213,7 +1108,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		}
 	}
 
-	// Summary
 	resultLines := []string{}
 	if compareItems["rows"] {
 		for _, db := range dbs {
