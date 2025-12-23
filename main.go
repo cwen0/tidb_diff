@@ -185,6 +185,43 @@ func diffSortedStrings(a, b []string) (onlyA, onlyB []string) {
 	return onlyA, onlyB
 }
 
+// parseTables 解析 tables 参数，格式：db1.tb1, db2.tb2
+// 返回按数据库分组的表列表 map[db][]table
+func parseTables(tablesStr string) (map[string][]string, error) {
+	result := make(map[string][]string)
+	if tablesStr == "" {
+		return result, nil
+	}
+
+	items := strings.Split(tablesStr, ",")
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+
+		// 解析 db.table 格式
+		parts := strings.Split(item, ".")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("无效的表格式: %s，应为 db.table 格式", item)
+		}
+
+		dbName := strings.TrimSpace(parts[0])
+		tableName := strings.TrimSpace(parts[1])
+
+		if dbName == "" || tableName == "" {
+			return nil, fmt.Errorf("无效的表格式: %s，数据库名和表名不能为空", item)
+		}
+
+		if result[dbName] == nil {
+			result[dbName] = []string{}
+		}
+		result[dbName] = append(result[dbName], tableName)
+	}
+
+	return result, nil
+}
+
 func (d *DBDataDiff) getDBList(db *sql.DB, dbPattern string, snapshotTS *string) ([]string, error) {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
@@ -371,21 +408,30 @@ type CheckResult struct {
 	RowsForCSV [][]string
 }
 
-func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string) CheckResult {
+func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string, specifiedTables []string) CheckResult {
 	errList := []string{}
 	rowsForCSV := [][]string{}
 	var errListMu sync.Mutex
 
-	srcTables, err := d.getTableList(srcDB, db, srcSnapshotTS)
-	if err != nil {
-		errList = append(errList, fmt.Sprintf("获取源库表列表失败：%v", err))
-		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
-	}
+	var srcTables, dstTables []string
+	var err error
 
-	dstTables, err := d.getTableList(dstDB, db, dstSnapshotTS)
-	if err != nil {
-		errList = append(errList, fmt.Sprintf("获取目标库表列表失败：%v", err))
-		return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
+	// 如果指定了表列表，直接使用指定的表；否则获取数据库的所有表
+	if len(specifiedTables) > 0 {
+		srcTables = specifiedTables
+		dstTables = specifiedTables
+	} else {
+		srcTables, err = d.getTableList(srcDB, db, srcSnapshotTS)
+		if err != nil {
+			errList = append(errList, fmt.Sprintf("获取源库表列表失败：%v", err))
+			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
+		}
+
+		dstTables, err = d.getTableList(dstDB, db, dstSnapshotTS)
+		if err != nil {
+			errList = append(errList, fmt.Sprintf("获取目标库表列表失败：%v", err))
+			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
+		}
 	}
 
 	srcTables = d.removeIgnoredTables(srcTables, ignoreTables)
@@ -877,8 +923,18 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 
 	dbPatterns := section.Key("dbs").Strings(",")
-	if len(dbPatterns) == 0 {
-		errorLog("未指定对应数据库清单，退出")
+	tablesStr := section.Key("tables").String()
+
+	// 验证 dbs 和 tables 必须有一个为空
+	dbPatternsEmpty := len(dbPatterns) == 0 || (len(dbPatterns) == 1 && strings.TrimSpace(dbPatterns[0]) == "")
+	tablesEmpty := strings.TrimSpace(tablesStr) == ""
+
+	if dbPatternsEmpty && tablesEmpty {
+		errorLog("dbs 和 tables 参数必须指定一个，退出")
+		return ""
+	}
+	if !dbPatternsEmpty && !tablesEmpty {
+		errorLog("dbs 和 tables 参数不能同时指定，必须有一个为空，退出")
 		return ""
 	}
 
@@ -912,35 +968,63 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	defer closeDBWithTimeout(dstDB, "目标库")
 
 	var dbs []string
-	dbSet := make(map[string]bool)
+	dbTablesMap := make(map[string][]string) // 数据库到表列表的映射
 	var srcSnapshotTSPtr *string
 	if srcSnapshotTS != "" {
 		srcSnapshotTSPtr = &srcSnapshotTS
 	}
-	for _, pattern := range dbPatterns {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			continue
-		}
-		dbList, err := d.getDBList(srcDB, pattern, srcSnapshotTSPtr)
+
+	// 如果使用 tables 参数
+	if !tablesEmpty {
+		parsedTables, err := parseTables(tablesStr)
 		if err != nil {
-			errorLog(fmt.Sprintf("获取数据库列表失败：%v", err))
-			continue
+			errorLog(fmt.Sprintf("解析 tables 参数失败：%v", err))
+			return ""
 		}
-		for _, db := range dbList {
-			if !dbSet[db] {
-				dbs = append(dbs, db)
-				dbSet[db] = true
+
+		if len(parsedTables) == 0 {
+			errorLog("tables 参数解析后为空，退出")
+			return ""
+		}
+
+		// 从 tables 参数中提取数据库列表
+		for dbName, tables := range parsedTables {
+			dbs = append(dbs, dbName)
+			dbTablesMap[dbName] = tables
+		}
+
+		info(fmt.Sprintf("使用 tables 参数，找到 %d 个数据库需要校验", len(dbs)))
+		for dbName, tables := range dbTablesMap {
+			info(fmt.Sprintf("  数据库 %s: %d 张表", dbName, len(tables)))
+		}
+	} else {
+		// 使用 dbs 参数
+		dbSet := make(map[string]bool)
+		for _, pattern := range dbPatterns {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			dbList, err := d.getDBList(srcDB, pattern, srcSnapshotTSPtr)
+			if err != nil {
+				errorLog(fmt.Sprintf("获取数据库列表失败：%v", err))
+				continue
+			}
+			for _, db := range dbList {
+				if !dbSet[db] {
+					dbs = append(dbs, db)
+					dbSet[db] = true
+				}
 			}
 		}
-	}
 
-	if len(dbs) == 0 {
-		errorLog("未找到匹配的数据库")
-		return ""
-	}
+		if len(dbs) == 0 {
+			errorLog("未找到匹配的数据库")
+			return ""
+		}
 
-	info(fmt.Sprintf("找到 %d 个数据库需要校验", len(dbs)))
+		info(fmt.Sprintf("找到 %d 个数据库需要校验", len(dbs)))
+	}
 
 	if compareItems["tables"] || compareItems["indexes"] || compareItems["views"] {
 		var srcSnapshotTSPtr, dstSnapshotTSPtr *string
@@ -1016,7 +1100,12 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 				if dstSnapshotTS != "" {
 					dstTS = &dstSnapshotTS
 				}
-				result := d.checkSingleDB(db, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
+				// 如果指定了表列表，使用指定的表；否则传入 nil 表示使用所有表
+				var specifiedTables []string
+				if tables, exists := dbTablesMap[db]; exists {
+					specifiedTables = tables
+				}
+				result := d.checkSingleDB(db, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS, specifiedTables)
 				errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 				allRows = append(allRows, result.RowsForCSV...)
 				info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", processedDBs, totalDBs, db))
@@ -1028,8 +1117,14 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			semaphore := make(chan struct{}, concurrency)
 
 			for _, db := range dbs {
+				// 在 goroutine 外部获取表列表，避免在 goroutine 内加锁
+				var specifiedTables []string
+				if tables, exists := dbTablesMap[db]; exists {
+					specifiedTables = tables
+				}
+
 				wg.Add(1)
-				go func(dbName string) {
+				go func(dbName string, tables []string) {
 					defer wg.Done()
 					semaphore <- struct{}{}
 					defer func() { <-semaphore }()
@@ -1048,14 +1143,14 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 					if dstSnapshotTS != "" {
 						dstTS = &dstSnapshotTS
 					}
-					result := d.checkSingleDB(dbName, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS)
+					result := d.checkSingleDB(dbName, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS, tables)
 
 					mu.Lock()
 					errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 					allRows = append(allRows, result.RowsForCSV...)
 					info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", currentProgress, totalDBs, dbName))
 					mu.Unlock()
-				}(db)
+				}(db, specifiedTables)
 			}
 			wg.Wait()
 		}
