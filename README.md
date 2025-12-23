@@ -55,7 +55,7 @@ make help
 
 ```bash
 # 下载预编译的二进制文件包（请替换为实际的版本号和仓库地址）
-wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.4/build.tar.gz
+wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.5/build.tar.gz
 
 # 解压
 tar -zxvf build.tar.gz
@@ -77,7 +77,7 @@ vi config.ini
 ```
 
 **注意**：
-- 请将 `v0.0.4` 替换为最新的版本号
+- 请将 `v0.0.5` 替换为最新的版本号
 - 请将 `cwen0/tidb_diff` 替换为实际的 GitHub 仓库地址
 - 根据你的系统架构（amd64 或 arm64）和操作系统（Linux、macOS、Windows）选择对应的二进制文件
 - 首次运行前需要编辑 `config.ini` 配置文件，设置正确的数据库连接信息
@@ -90,7 +90,12 @@ vi config.ini
 [diff]
 src.instance = mysql://root@127.0.0.1:4000
 dst.instance = mysql://root@127.0.0.1:63844
-dbs = test%
+# dbs 和 tables 参数必须指定一个，且不能同时指定
+# dbs: 数据库模式匹配，支持 LIKE 模式（如 test%）
+# tables: 指定要对比的表，格式为 db1.tb1, db2.tb2
+# 当指定 tables 时，只对比指定的表；当指定 dbs 时，对比匹配数据库的所有表
+# dbs = test
+tables = test.bank1
 ignore_tables = tmp_log, sys_history
 threshold = 0
 output = diff_result.csv
