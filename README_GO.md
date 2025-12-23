@@ -52,28 +52,32 @@ output = diff_result.csv
 # Leave empty to enable all
 compare = rows,tables,indexes,views
 
-# Database-level concurrency
-# Default: 5 (optimized for multi-database scenarios)
-# Recommended range: 3-20
-# - Few databases (<10): 3-5
+# Database-level concurrency (number of databases processed simultaneously)
+# Program default (if not configured): 5 (throughput-oriented for multi-DB scenarios)
+# Recommended range: 1-20 (in production, start from 1 and increase gradually while watching QPS/CPU/connections)
+# - Few databases (<10): 1-5
 # - Medium databases (10-50): 5-10
 # - Many databases (>50): 10-20
-# Note: Each database needs 2 connection pools (source + destination)
-concurrency = 5
+# Notes:
+# - Each database connects to both source and destination (2 pools); ensure max_open_conns is sufficient
+# - When use_stats=false, table-level concurrency is added and overall pressure increases (see table_concurrency)
+concurrency = 1
 
-# Use statistics for fast row count (default true, fast but may be inaccurate)
-# Set to false to use exact COUNT(1) with table-level concurrency
+# Use statistics for fast row count
+# Program default (if not configured): true
+# - true: read INFORMATION_SCHEMA.TABLES.TABLE_ROWS (fast but may be inaccurate)
+# - false: run exact COUNT(1) per table (heavier but accurate; supports table-level concurrency via table_concurrency)
 use_stats = false
 
 # Table-level concurrency (only effective when use_stats=false)
-# Default: 30 (optimized for multi-table scenarios)
-# Recommended range: 10-50
+# Program default (if not configured): 30 (throughput-oriented for multi-table scenarios)
+# Recommended range: 1-50 (increase gradually to avoid overloading TiDB)
 # - Few tables (<100): 10-20
 # - Medium tables (100-500): 20-30
 # - Many tables (500-1000): 30-40
 # - Very many tables (>1000): 40-50
-# Note: Source and destination execute in parallel, actual concurrency = table_concurrency * 2
-table_concurrency = 30
+# Note (rough estimate; bounded by pool/latency): single DB ~ table_concurrency * 2; overall ~ concurrency * table_concurrency * 2
+table_concurrency = 1
 
 # Connection pool configuration (optimized for multi-DB, multi-table, large table scenarios)
 # max_open_conns: Maximum open connections
@@ -219,24 +223,24 @@ max_retries = 2
 #### Concurrency Configuration
 
 - `concurrency`: Database-level concurrency, number of databases processed simultaneously
-  - Default: 5 (optimized for multi-database scenarios)
-  - Recommended range: 3-20
-  - Few databases (<10): 3-5
+  - Program default (if not configured): 5
+  - Recommended range: 1-20 (in production, start from 1 and increase gradually)
+  - Few databases (<10): 1-5
   - Medium databases (10-50): 5-10
   - Many databases (>50): 10-20
 
 - `use_stats`: Whether to use statistics for fast row count (default `true`)
   - `true`: Use `INFORMATION_SCHEMA.TABLES.TABLE_ROWS`, fast but may be inaccurate
-  - `false`: Use exact `COUNT(1)` with table-level concurrency, higher performance
+  - `false`: Use exact `COUNT(1)`, accurate but heavier; supports table-level concurrency via `table_concurrency`
 
 - `table_concurrency`: Table-level concurrency (only effective when `use_stats=false`)
-  - Default: 30 (optimized for multi-table scenarios)
-  - Recommended range: 10-50
+  - Program default (if not configured): 30
+  - Recommended range: 1-50
   - Few tables (<100): 10-20
   - Medium tables (100-500): 20-30
   - Many tables (500-1000): 30-40
   - Very many tables (>1000): 40-50
-  - Note: Source and destination execute in parallel, actual concurrency = `table_concurrency * 2`
+  - Note (rough estimate): single DB ~ `table_concurrency * 2`; overall ~ `concurrency * table_concurrency * 2`
 
 #### Connection Pool Configuration (optimized for multi-DB, multi-table, large table scenarios)
 
