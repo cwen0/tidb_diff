@@ -83,12 +83,12 @@ table_concurrency = 1
 # max_open_conns: Maximum open connections
 # If not configured (set to 0), automatically calculated based on concurrency and table_concurrency
 #   Formula: concurrency * 2 * (table_concurrency + 10)
-#   Range: 1-500 (auto-limited)
-# Manual configuration recommendations:
+#   Minimum: 1 (no enforced upper bound; size it based on DB connection limits)
+# Manual configuration recommendations (can exceed 500 if needed):
 # - Few DBs/tables: 100-150
 # - Medium DBs/tables: 150-250
 # - Many DBs/tables: 250-400
-# - Very many DBs/tables: 400-500
+# - Very many DBs/tables: 400-600+
 max_open_conns = 0
 
 # max_idle_conns: Maximum idle connections
@@ -247,12 +247,12 @@ max_retries = 2
 - `max_open_conns`: Maximum open connections
   - Default: 0 (auto-calculated)
   - Auto-calculation formula: `concurrency * 2 * (table_concurrency + 10)`
-  - Auto-limited range: 1-500
-  - Manual configuration recommendations:
+  - Lower bound: 1 (no enforced upper bound; tune based on DB connection limits/resources)
+  - Manual configuration recommendations (can exceed 500 if needed):
     - Few DBs/tables: 100-150
     - Medium DBs/tables: 150-250
     - Many DBs/tables: 250-400
-    - Very many DBs/tables: 400-500
+    - Very many DBs/tables: 400-600+
   - Note: Each database needs 2 connection pools (source + destination)
 
 - `max_idle_conns`: Maximum idle connections
@@ -358,7 +358,7 @@ max_retries = 3
 ```ini
 concurrency = 15
 table_concurrency = 40
-max_open_conns = 500  # Manual max value
+max_open_conns = 800  # Set as needed (no enforced cap)
 max_idle_conns = 400
 conn_max_lifetime_minutes = 60
 use_stats = false

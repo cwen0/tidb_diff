@@ -137,12 +137,12 @@ table_concurrency = 1
 # max_open_conns: 最大打开连接数
 # 如果未配置（设置为 0），将根据 concurrency 和 table_concurrency 自动计算：
 #   公式：concurrency * 2 * (table_concurrency + 10)
-#   范围：1-500（自动限制）
-# 手动配置建议：
+#   最小值：1（不再强制上限，请结合实例允许的最大连接数自行评估）
+# 手动配置建议（可按需超过 500，仅供起步参考）：
 # - 少量库表：100-150
 # - 中等库表：150-250
 # - 大量库表：250-400
-# - 超大量库表：400-500
+# - 超大量库表：400-600+
 # 注意：每个数据库需要 2 个连接池（源+目标），请确保连接数足够
 max_open_conns = 0
 
@@ -264,12 +264,12 @@ max_retries = 2
 - `max_open_conns`: 最大打开连接数
   - 默认值：0（自动计算）
   - 自动计算公式：`concurrency * 2 * (table_concurrency + 10)`
-  - 自动限制范围：1-500
-  - 手动配置建议：
+  - 下限：1（不再强制上限，请结合实例最大连接数/资源自行控制）
+  - 手动配置建议（可按需超过 500，仅供起步参考）：
     - 少量库表：100-150
     - 中等库表：150-250
     - 大量库表：250-400
-    - 超大量库表：400-500
+    - 超大量库表：400-600+
   - 注意：每个数据库需要 2 个连接池（源+目标），请确保连接数足够
 
 - `max_idle_conns`: 最大空闲连接数
@@ -433,7 +433,7 @@ max_retries = 3
 ```ini
 concurrency = 15
 table_concurrency = 40
-max_open_conns = 500  # 手动设置最大值
+max_open_conns = 800  # 按需设置（不再强制上限）
 max_idle_conns = 400
 conn_max_lifetime_minutes = 60
 use_stats = false

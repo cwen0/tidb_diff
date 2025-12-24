@@ -882,9 +882,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		if maxOpenConns < 1 {
 			maxOpenConns = 1
 		}
-		if maxOpenConns > 500 {
-			maxOpenConns = 500
-		}
 	}
 
 	if section.HasKey("max_idle_conns") {
@@ -920,9 +917,6 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
 		if maxOpenConns < 1 {
 			maxOpenConns = 1
-		}
-		if maxOpenConns > 500 {
-			maxOpenConns = 500
 		}
 	}
 	if maxIdleConns < 1 {
