@@ -38,6 +38,7 @@ type snapshotConnPool struct {
 	db         *sql.DB
 	snapshotTS *string
 	pool       chan *sql.Conn
+	sem        chan struct{} // 限制最多创建 size 个连接
 }
 
 func newSnapshotConnPool(db *sql.DB, snapshotTS *string, size int) *snapshotConnPool {
@@ -48,6 +49,7 @@ func newSnapshotConnPool(db *sql.DB, snapshotTS *string, size int) *snapshotConn
 		db:         db,
 		snapshotTS: snapshotTS,
 		pool:       make(chan *sql.Conn, size),
+		sem:        make(chan struct{}, size),
 	}
 }
 
@@ -58,16 +60,26 @@ func (p *snapshotConnPool) acquire() (*sql.Conn, error) {
 	default:
 	}
 
+	// 如果当前连接数已达上限，则等待有连接归还
+	select {
+	case p.sem <- struct{}{}:
+	default:
+		conn := <-p.pool
+		return conn, nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultConnAcquireTimeout)
 	defer cancel()
 
 	conn, err := p.db.Conn(ctx)
 	if err != nil {
+		<-p.sem // 归还额度
 		return nil, err
 	}
 
 	if err := setSnapshotOnConn(ctx, conn, p.snapshotTS); err != nil {
 		_ = conn.Close()
+		<-p.sem // 归还额度
 		return nil, err
 	}
 
@@ -83,6 +95,7 @@ func (p *snapshotConnPool) release(conn *sql.Conn) {
 	case p.pool <- conn:
 	default:
 		_ = conn.Close()
+		<-p.sem // 释放额度
 	}
 }
 
@@ -91,6 +104,7 @@ func (p *snapshotConnPool) close() {
 		select {
 		case conn := <-p.pool:
 			_ = conn.Close()
+			<-p.sem // 释放额度
 		default:
 			return
 		}
