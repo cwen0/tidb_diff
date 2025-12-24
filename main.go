@@ -130,13 +130,13 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	if d.maxOpenConns > 0 {
 		db.SetMaxOpenConns(d.maxOpenConns)
 	} else {
-		db.SetMaxOpenConns(100)
+		db.SetMaxOpenConns(1)
 	}
 
 	if d.maxIdleConns > 0 {
 		db.SetMaxIdleConns(d.maxIdleConns)
 	} else {
-		db.SetMaxIdleConns(80)
+		db.SetMaxIdleConns(1)
 	}
 
 	if d.connMaxLifetime > 0 {
@@ -837,8 +837,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		maxOpenConns = section.Key("max_open_conns").MustInt(0)
 	} else {
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
-		if maxOpenConns < 100 {
-			maxOpenConns = 100
+		if maxOpenConns < 1 {
+			maxOpenConns = 1
 		}
 		if maxOpenConns > 500 {
 			maxOpenConns = 500
@@ -849,8 +849,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		maxIdleConns = section.Key("max_idle_conns").MustInt(0)
 	} else {
 		maxIdleConns = int(float64(maxOpenConns) * 0.8)
-		if maxIdleConns < 80 {
-			maxIdleConns = 80
+		if maxIdleConns < 1 {
+			maxIdleConns = 1
 		}
 	}
 
@@ -876,8 +876,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 
 	if maxOpenConns < 1 {
 		maxOpenConns = concurrency * 2 * (tableConcurrency + 10)
-		if maxOpenConns < 100 {
-			maxOpenConns = 100
+		if maxOpenConns < 1 {
+			maxOpenConns = 1
 		}
 		if maxOpenConns > 500 {
 			maxOpenConns = 500
@@ -885,8 +885,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 	if maxIdleConns < 1 {
 		maxIdleConns = int(float64(maxOpenConns) * 0.8)
-		if maxIdleConns < 80 {
-			maxIdleConns = 80
+		if maxIdleConns < 1 {
+			maxIdleConns = 1
 		}
 	}
 	d.setConnectionPoolConfig(maxOpenConns, maxIdleConns, connMaxLifetimeMinutes, queryTimeoutSeconds, readTimeoutSeconds, writeTimeoutSeconds)

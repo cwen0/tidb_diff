@@ -137,7 +137,7 @@ table_concurrency = 1
 # max_open_conns: 最大打开连接数
 # 如果未配置（设置为 0），将根据 concurrency 和 table_concurrency 自动计算：
 #   公式：concurrency * 2 * (table_concurrency + 10)
-#   范围：100-500（自动限制）
+#   范围：1-500（自动限制）
 # 手动配置建议：
 # - 少量库表：100-150
 # - 中等库表：150-250
@@ -147,7 +147,7 @@ table_concurrency = 1
 max_open_conns = 0
 
 # max_idle_conns: 最大空闲连接数
-# 如果未配置（设置为 0），将自动计算为 max_open_conns 的 80%（最小 80）
+# 如果未配置（设置为 0），将自动计算为 max_open_conns 的 80%（最小 1）
 # 保持连接池热状态，减少连接建立开销
 max_idle_conns = 0
 
@@ -264,7 +264,7 @@ max_retries = 2
 - `max_open_conns`: 最大打开连接数
   - 默认值：0（自动计算）
   - 自动计算公式：`concurrency * 2 * (table_concurrency + 10)`
-  - 自动限制范围：100-500
+  - 自动限制范围：1-500
   - 手动配置建议：
     - 少量库表：100-150
     - 中等库表：150-250
@@ -273,7 +273,7 @@ max_retries = 2
   - 注意：每个数据库需要 2 个连接池（源+目标），请确保连接数足够
 
 - `max_idle_conns`: 最大空闲连接数
-  - 默认值：0（自动计算为 `max_open_conns` 的 80%，最小 80）
+  - 默认值：0（自动计算为 `max_open_conns` 的 80%，最小 1）
   - 保持连接池热状态，减少连接建立开销
 
 - `conn_max_lifetime_minutes`: 连接最大生存时间（分钟）
