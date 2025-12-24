@@ -31,6 +31,71 @@ func errorLog(msg string) {
 }
 
 const defaultDBCloseTimeout = 5 * time.Second
+const defaultConnAcquireTimeout = 30 * time.Second
+
+// snapshotConnPool 管理已设置 snapshot_ts 的连接，避免重复设置。
+type snapshotConnPool struct {
+	db         *sql.DB
+	snapshotTS *string
+	pool       chan *sql.Conn
+}
+
+func newSnapshotConnPool(db *sql.DB, snapshotTS *string, size int) *snapshotConnPool {
+	if size < 1 {
+		size = 1
+	}
+	return &snapshotConnPool{
+		db:         db,
+		snapshotTS: snapshotTS,
+		pool:       make(chan *sql.Conn, size),
+	}
+}
+
+func (p *snapshotConnPool) acquire() (*sql.Conn, error) {
+	select {
+	case conn := <-p.pool:
+		return conn, nil
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultConnAcquireTimeout)
+	defer cancel()
+
+	conn, err := p.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := setSnapshotOnConn(ctx, conn, p.snapshotTS); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func (p *snapshotConnPool) release(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+
+	select {
+	case p.pool <- conn:
+	default:
+		_ = conn.Close()
+	}
+}
+
+func (p *snapshotConnPool) close() {
+	for {
+		select {
+		case conn := <-p.pool:
+			_ = conn.Close()
+		default:
+			return
+		}
+	}
+}
 
 // closeDBWithTimeout 关闭 *sql.DB，避免 driver/网络异常导致 Close() 阻塞不退出。
 func closeDBWithTimeout(db *sql.DB, label string) {
@@ -146,7 +211,7 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	return db, nil
 }
 
-func (d *DBDataDiff) setSnapshotOnConn(ctx context.Context, conn *sql.Conn, snapshotTS *string) error {
+func setSnapshotOnConn(ctx context.Context, conn *sql.Conn, snapshotTS *string) error {
 	if snapshotTS != nil && *snapshotTS != "" {
 		snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
 		if parseErr != nil {
@@ -222,18 +287,14 @@ func parseTables(tablesStr string) (map[string][]string, error) {
 	return result, nil
 }
 
-func (d *DBDataDiff) getDBList(db *sql.DB, dbPattern string, snapshotTS *string) ([]string, error) {
-	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+func (d *DBDataDiff) getDBList(pool *snapshotConnPool, dbPattern string) ([]string, error) {
+	conn, err := pool.acquire()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer pool.release(conn)
 
-	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
-		return nil, err
-	}
-
+	ctx := context.Background()
 	pattern := strings.TrimSpace(dbPattern)
 	if pattern == "" {
 		return []string{}, nil
@@ -263,7 +324,7 @@ type SchemaObjectCounts struct {
 	Views   map[string]int
 }
 
-func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*SchemaObjectCounts, error) {
+func (d *DBDataDiff) getSchemaObjectCounts(pool *snapshotConnPool) (*SchemaObjectCounts, error) {
 	result := &SchemaObjectCounts{
 		Tables:  make(map[string]int),
 		Indexes: make(map[string]int),
@@ -271,15 +332,11 @@ func (d *DBDataDiff) getSchemaObjectCounts(db *sql.DB, snapshotTS *string) (*Sch
 	}
 
 	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+	conn, err := pool.acquire()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
-		return nil, err
-	}
+	defer pool.release(conn)
 
 	tableSQL := `
 		SELECT t.TABLE_SCHEMA, COUNT(*) AS sum
@@ -408,7 +465,7 @@ type CheckResult struct {
 	RowsForCSV [][]string
 }
 
-func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, srcSnapshotTS, dstSnapshotTS *string, specifiedTables []string) CheckResult {
+func (d *DBDataDiff) checkSingleDB(db string, srcPool, dstPool *snapshotConnPool, ignoreTables []string, threshold int, useStats bool, tableConcurrency int, specifiedTables []string) CheckResult {
 	errList := []string{}
 	rowsForCSV := [][]string{}
 	var errListMu sync.Mutex
@@ -421,13 +478,13 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 		srcTables = specifiedTables
 		dstTables = specifiedTables
 	} else {
-		srcTables, err = d.getTableList(srcDB, db, srcSnapshotTS)
+		srcTables, err = d.getTableList(srcPool, db)
 		if err != nil {
 			errList = append(errList, fmt.Sprintf("获取源库表列表失败：%v", err))
 			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 		}
 
-		dstTables, err = d.getTableList(dstDB, db, dstSnapshotTS)
+		dstTables, err = d.getTableList(dstPool, db)
 		if err != nil {
 			errList = append(errList, fmt.Sprintf("获取目标库表列表失败：%v", err))
 			return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
@@ -478,7 +535,7 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 
 		go func() {
 			defer statsWg.Done()
-			srcData, srcErr = d.getTableRowCountsFromStats(srcDB, db, srcTables, srcSnapshotTS)
+			srcData, srcErr = d.getTableRowCountsFromStats(srcPool, db, srcTables)
 			if srcErr != nil {
 				errListMu.Lock()
 				errList = append(errList, fmt.Sprintf("从统计信息获取源库行数失败：%v", srcErr))
@@ -488,7 +545,7 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 
 		go func() {
 			defer statsWg.Done()
-			dstData, dstErr = d.getTableRowCountsFromStats(dstDB, db, dstTables, dstSnapshotTS)
+			dstData, dstErr = d.getTableRowCountsFromStats(dstPool, db, dstTables)
 			if dstErr != nil {
 				errListMu.Lock()
 				errList = append(errList, fmt.Sprintf("从统计信息获取目标库行数失败：%v", dstErr))
@@ -511,7 +568,7 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 
 		go func() {
 			defer countWg.Done()
-			srcData, srcErrList = d.countTableRowsConcurrent(srcDB, db, srcTables, tableConcurrency, srcSnapshotTS)
+			srcData, srcErrList = d.countTableRowsConcurrent(srcPool, db, srcTables, tableConcurrency)
 			for _, err := range srcErrList {
 				errListMu.Lock()
 				errList = append(errList, err.Error())
@@ -521,7 +578,7 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 
 		go func() {
 			defer countWg.Done()
-			dstData, dstErrList = d.countTableRowsConcurrent(dstDB, db, dstTables, tableConcurrency, dstSnapshotTS)
+			dstData, dstErrList = d.countTableRowsConcurrent(dstPool, db, dstTables, tableConcurrency)
 			for _, err := range dstErrList {
 				errListMu.Lock()
 				errList = append(errList, err.Error())
@@ -571,17 +628,13 @@ func (d *DBDataDiff) checkSingleDB(db string, srcDB, dstDB *sql.DB, ignoreTables
 	return CheckResult{DBName: db, ErrList: errList, RowsForCSV: rowsForCSV}
 }
 
-func (d *DBDataDiff) getTableList(db *sql.DB, schema string, snapshotTS *string) ([]string, error) {
+func (d *DBDataDiff) getTableList(pool *snapshotConnPool, schema string) ([]string, error) {
 	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+	conn, err := pool.acquire()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
-		return nil, err
-	}
+	defer pool.release(conn)
 
 	// 只返回 BASE TABLE，避免把 VIEW 也纳入逐表 COUNT 导致报错/结果不准。
 	query := "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name"
@@ -617,7 +670,7 @@ func (d *DBDataDiff) removeIgnoredTables(tables []string, ignoreTables []string)
 	return result
 }
 
-func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables []string, concurrency int, snapshotTS *string) (map[string]int64, []error) {
+func (d *DBDataDiff) countTableRowsConcurrent(pool *snapshotConnPool, dbName string, tables []string, concurrency int) (map[string]int64, []error) {
 	result := make(map[string]int64)
 	var errList []error
 	var mu sync.Mutex
@@ -638,11 +691,10 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			const connAcquireTimeout = 30 * time.Second
 			var conn *sql.Conn
 			defer func() {
 				if conn != nil {
-					_ = conn.Close()
+					pool.release(conn)
 				}
 			}()
 
@@ -650,14 +702,8 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 				if conn != nil {
 					return nil
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), connAcquireTimeout)
-				defer cancel()
-				c, err := db.Conn(ctx)
+				c, err := pool.acquire()
 				if err != nil {
-					return err
-				}
-				if err := d.setSnapshotOnConn(ctx, c, snapshotTS); err != nil {
-					_ = c.Close()
 					return err
 				}
 				conn = c
@@ -742,7 +788,7 @@ func (d *DBDataDiff) countTableRowsConcurrent(db *sql.DB, dbName string, tables 
 	return result, errList
 }
 
-func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, tables []string, snapshotTS *string) (map[string]int64, error) {
+func (d *DBDataDiff) getTableRowCountsFromStats(pool *snapshotConnPool, schema string, tables []string) (map[string]int64, error) {
 	result := make(map[string]int64)
 
 	if len(tables) == 0 {
@@ -754,15 +800,11 @@ func (d *DBDataDiff) getTableRowCountsFromStats(db *sql.DB, schema string, table
 	}
 
 	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+	conn, err := pool.acquire()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	if err := d.setSnapshotOnConn(ctx, conn, snapshotTS); err != nil {
-		return nil, err
-	}
+	defer pool.release(conn)
 
 	// 分批构造 IN 子句，避免表数量过多导致 SQL 太长/占位符超限。
 	const maxInClauseItems = 500
@@ -953,6 +995,14 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		info(fmt.Sprintf("目标库将使用 snapshot_ts: %s", dstSnapshotTS))
 	}
 
+	var srcSnapshotTSPtr, dstSnapshotTSPtr *string
+	if srcSnapshotTS != "" {
+		srcSnapshotTSPtr = &srcSnapshotTS
+	}
+	if dstSnapshotTS != "" {
+		dstSnapshotTSPtr = &dstSnapshotTS
+	}
+
 	srcDB, err := d.getConnection(src)
 	if err != nil {
 		errorLog(fmt.Sprintf("连接源库失败：%v", err))
@@ -967,12 +1017,24 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 	defer closeDBWithTimeout(dstDB, "目标库")
 
+	desiredPoolSize := concurrency
+	if tableConcurrency > desiredPoolSize {
+		desiredPoolSize = tableConcurrency
+	}
+	if desiredPoolSize < 1 {
+		desiredPoolSize = 1
+	}
+	poolSize := desiredPoolSize
+	if maxOpenConns > 0 && poolSize > maxOpenConns {
+		poolSize = maxOpenConns
+	}
+	srcPool := newSnapshotConnPool(srcDB, srcSnapshotTSPtr, poolSize)
+	dstPool := newSnapshotConnPool(dstDB, dstSnapshotTSPtr, poolSize)
+	defer srcPool.close()
+	defer dstPool.close()
+
 	var dbs []string
 	dbTablesMap := make(map[string][]string) // 数据库到表列表的映射
-	var srcSnapshotTSPtr *string
-	if srcSnapshotTS != "" {
-		srcSnapshotTSPtr = &srcSnapshotTS
-	}
 
 	// 如果使用 tables 参数
 	if !tablesEmpty {
@@ -1005,7 +1067,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			if pattern == "" {
 				continue
 			}
-			dbList, err := d.getDBList(srcDB, pattern, srcSnapshotTSPtr)
+			dbList, err := d.getDBList(srcPool, pattern)
 			if err != nil {
 				errorLog(fmt.Sprintf("获取数据库列表失败：%v", err))
 				continue
@@ -1027,19 +1089,11 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 
 	if compareItems["tables"] || compareItems["indexes"] || compareItems["views"] {
-		var srcSnapshotTSPtr, dstSnapshotTSPtr *string
-		if srcSnapshotTS != "" {
-			srcSnapshotTSPtr = &srcSnapshotTS
-		}
-		if dstSnapshotTS != "" {
-			dstSnapshotTSPtr = &dstSnapshotTS
-		}
-
-		srcCounts, err := d.getSchemaObjectCounts(srcDB, srcSnapshotTSPtr)
+		srcCounts, err := d.getSchemaObjectCounts(srcPool)
 		if err != nil {
 			errorLog(fmt.Sprintf("统计源库对象数量失败：%v", err))
 		} else {
-			dstCounts, err := d.getSchemaObjectCounts(dstDB, dstSnapshotTSPtr)
+			dstCounts, err := d.getSchemaObjectCounts(dstPool)
 			if err != nil {
 				errorLog(fmt.Sprintf("统计目标库对象数量失败：%v", err))
 			} else {
@@ -1093,19 +1147,12 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 			for _, db := range dbs {
 				processedDBs++
 				info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", processedDBs, totalDBs, db))
-				var srcTS, dstTS *string
-				if srcSnapshotTS != "" {
-					srcTS = &srcSnapshotTS
-				}
-				if dstSnapshotTS != "" {
-					dstTS = &dstSnapshotTS
-				}
 				// 如果指定了表列表，使用指定的表；否则传入 nil 表示使用所有表
 				var specifiedTables []string
 				if tables, exists := dbTablesMap[db]; exists {
 					specifiedTables = tables
 				}
-				result := d.checkSingleDB(db, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS, specifiedTables)
+				result := d.checkSingleDB(db, srcPool, dstPool, ignoreTables, threshold, useStats, tableConcurrency, specifiedTables)
 				errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
 				allRows = append(allRows, result.RowsForCSV...)
 				info(fmt.Sprintf("[进度 %d/%d] 完成校验数据库: %s", processedDBs, totalDBs, db))
@@ -1136,14 +1183,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 
 					info(fmt.Sprintf("[进度 %d/%d] 开始校验数据库: %s", currentProgress, totalDBs, dbName))
 
-					var srcTS, dstTS *string
-					if srcSnapshotTS != "" {
-						srcTS = &srcSnapshotTS
-					}
-					if dstSnapshotTS != "" {
-						dstTS = &dstSnapshotTS
-					}
-					result := d.checkSingleDB(dbName, srcDB, dstDB, ignoreTables, threshold, useStats, tableConcurrency, srcTS, dstTS, tables)
+					result := d.checkSingleDB(dbName, srcPool, dstPool, ignoreTables, threshold, useStats, tableConcurrency, tables)
 
 					mu.Lock()
 					errTls[result.DBName] = append(errTls[result.DBName], result.ErrList...)
