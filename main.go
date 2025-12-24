@@ -1025,19 +1025,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 	defer closeDBWithTimeout(dstDB, "目标库")
 
-	desiredPoolSize := concurrency
-	if tableConcurrency > desiredPoolSize {
-		desiredPoolSize = tableConcurrency
-	}
-	if desiredPoolSize < 1 {
-		desiredPoolSize = 1
-	}
-	poolSize := desiredPoolSize
-	if maxOpenConns > 0 && poolSize > maxOpenConns {
-		poolSize = maxOpenConns
-	}
-	srcPool := newSnapshotConnPool(srcDB, srcSnapshotTSPtr, poolSize)
-	dstPool := newSnapshotConnPool(dstDB, dstSnapshotTSPtr, poolSize)
+	srcPool := newSnapshotConnPool(srcDB, srcSnapshotTSPtr, maxOpenConns)
+	dstPool := newSnapshotConnPool(dstDB, dstSnapshotTSPtr, maxOpenConns)
 	defer srcPool.close()
 	defer dstPool.close()
 
