@@ -31,7 +31,7 @@ func errorLog(msg string) {
 }
 
 const defaultDBCloseTimeout = 5 * time.Second
-const defaultConnAcquireTimeout = 30 * time.Second
+const defaultConnAcquireTimeout = 180 * time.Second
 
 // snapshotConnPool 管理已设置 snapshot_ts 的连接，避免重复设置。
 type snapshotConnPool struct {
