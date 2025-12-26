@@ -55,7 +55,7 @@ make help
 
 ```bash
 # 下载预编译的二进制文件包（请替换为实际的版本号和仓库地址）
-wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.5/build.tar.gz
+wget https://github.com/cwen0/tidb_diff/releases/download/v0.0.6/build.tar.gz
 
 # 解压
 tar -zxvf build.tar.gz
