@@ -116,9 +116,9 @@ compare = rows,tables,indexes,views
 concurrency = 1
 
 # 是否使用统计信息快速获取行数
-# 程序默认（未配置时）：true
+# 程序默认（未配置时）：false
+# - false：对每张表执行精确 COUNT(1)（默认，慢/重，但结果准确，可配表级并发 table_concurrency）
 # - true：读取 INFORMATION_SCHEMA.TABLES.TABLE_ROWS（快，但可能不够精确）
-# - false：对每张表执行精确 COUNT(1)（慢/重，但结果准确，可配表级并发 table_concurrency）
 use_stats = false
 
 # 表级别并发数（仅当 use_stats=false 时有效）
@@ -246,9 +246,9 @@ max_retries = 2
   - 大量库（>50）：10-20
   - 注意：每个数据库会同时连接源库+目标库（2 个连接池），请确保连接数足够
 
-- `use_stats`: 是否使用统计信息快速获取行数（默认 `true`）
+- `use_stats`: 是否使用统计信息快速获取行数（默认 `false`）
+  - `false`（默认）：使用精确 `COUNT(1)`，结果准确但更“重”，可配表级并发 `table_concurrency`
   - `true`: 使用 `INFORMATION_SCHEMA.TABLES.TABLE_ROWS`，速度快但可能不够精确
-  - `false`: 使用精确 `COUNT(1)`，结果准确但更“重”，可配表级并发 `table_concurrency`
 
 - `table_concurrency`: 表级别并发数（仅当 `use_stats=false` 时有效）
   - 程序默认（未配置时）：30

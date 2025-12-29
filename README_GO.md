@@ -64,9 +64,9 @@ compare = rows,tables,indexes,views
 concurrency = 1
 
 # Use statistics for fast row count
-# Program default (if not configured): true
+# Program default (if not configured): false
+# - false: run exact COUNT(1) per table (default; heavier but accurate, supports table-level concurrency via table_concurrency)
 # - true: read INFORMATION_SCHEMA.TABLES.TABLE_ROWS (fast but may be inaccurate)
-# - false: run exact COUNT(1) per table (heavier but accurate; supports table-level concurrency via table_concurrency)
 use_stats = false
 
 # Table-level concurrency (only effective when use_stats=false)
@@ -229,9 +229,9 @@ max_retries = 2
   - Medium databases (10-50): 5-10
   - Many databases (>50): 10-20
 
-- `use_stats`: Whether to use statistics for fast row count (default `true`)
+- `use_stats`: Whether to use statistics for fast row count (default `false`)
+  - `false` (default): Use exact `COUNT(1)`, accurate but heavier; supports table-level concurrency via `table_concurrency`
   - `true`: Use `INFORMATION_SCHEMA.TABLES.TABLE_ROWS`, fast but may be inaccurate
-  - `false`: Use exact `COUNT(1)`, accurate but heavier; supports table-level concurrency via `table_concurrency`
 
 - `table_concurrency`: Table-level concurrency (only effective when `use_stats=false`)
   - Program default (if not configured): 30

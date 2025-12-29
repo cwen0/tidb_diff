@@ -881,7 +881,7 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 		concurrency = 5
 	}
 
-	useStats := section.Key("use_stats").MustBool(true)
+	useStats := section.Key("use_stats").MustBool(false)
 
 	tableConcurrency := section.Key("table_concurrency").MustInt(30)
 	if tableConcurrency < 1 {
