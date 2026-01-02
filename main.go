@@ -33,21 +33,23 @@ func errorLog(msg string) {
 const defaultDBCloseTimeout = 5 * time.Second
 const defaultConnAcquireTimeout = 180 * time.Second
 
-// snapshotConnPool 管理已设置 snapshot_ts 的连接，避免重复设置。
+// snapshotConnPool 管理已设置 session 级别参数（如 snapshot_ts、max_execution_time）的连接，避免重复设置。
 type snapshotConnPool struct {
 	db         *sql.DB
 	snapshotTS *string
+	maxExecMS  *int
 	pool       chan *sql.Conn
 	sem        chan struct{} // 限制最多创建 size 个连接
 }
 
-func newSnapshotConnPool(db *sql.DB, snapshotTS *string, size int) *snapshotConnPool {
+func newSnapshotConnPool(db *sql.DB, snapshotTS *string, maxExecMS *int, size int) *snapshotConnPool {
 	if size < 1 {
 		size = 1
 	}
 	return &snapshotConnPool{
 		db:         db,
 		snapshotTS: snapshotTS,
+		maxExecMS:  maxExecMS,
 		pool:       make(chan *sql.Conn, size),
 		sem:        make(chan struct{}, size),
 	}
@@ -77,7 +79,7 @@ func (p *snapshotConnPool) acquire() (*sql.Conn, error) {
 		return nil, err
 	}
 
-	if err := setSnapshotOnConn(ctx, conn, p.snapshotTS); err != nil {
+	if err := setSessionOptionsOnConn(ctx, conn, p.snapshotTS, p.maxExecMS); err != nil {
 		_ = conn.Close()
 		<-p.sem // 归还额度
 		return nil, err
@@ -225,7 +227,13 @@ func (d *DBDataDiff) getConnection(instance string) (*sql.DB, error) {
 	return db, nil
 }
 
-func setSnapshotOnConn(ctx context.Context, conn *sql.Conn, snapshotTS *string) error {
+func setSessionOptionsOnConn(ctx context.Context, conn *sql.Conn, snapshotTS *string, maxExecMS *int) error {
+	if maxExecMS != nil && *maxExecMS > 0 {
+		if _, setErr := conn.ExecContext(ctx, "SET SESSION MAX_EXECUTION_TIME = ?", *maxExecMS); setErr != nil {
+			return fmt.Errorf("设置 max_execution_time 失败: %v", setErr)
+		}
+	}
+
 	if snapshotTS != nil && *snapshotTS != "" {
 		snapshotVal, parseErr := strconv.ParseInt(*snapshotTS, 10, 64)
 		if parseErr != nil {
@@ -918,6 +926,10 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 
 	readTimeoutSeconds := section.Key("read_timeout_seconds").MustInt(0)
 	writeTimeoutSeconds := section.Key("write_timeout_seconds").MustInt(0)
+	maxExecutionTimeMS := section.Key("max_execution_time_ms").MustInt(0)
+	if maxExecutionTimeMS < 0 {
+		maxExecutionTimeMS = 0
+	}
 
 	maxRetries := section.Key("max_retries").MustInt(2)
 	if maxRetries < 0 {
@@ -945,6 +957,9 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	info(fmt.Sprintf("连接池配置：max_open_conns=%d, max_idle_conns=%d, conn_max_lifetime=%d分钟",
 		maxOpenConns, maxIdleConns, connMaxLifetimeMinutes))
 	info(fmt.Sprintf("并发配置：数据库级别=%d, 表级别=%d, 查询重试次数=%d", concurrency, tableConcurrency, maxRetries))
+	if maxExecutionTimeMS > 0 {
+		info(fmt.Sprintf("连接将设置 session max_execution_time=%d ms", maxExecutionTimeMS))
+	}
 
 	compareStr := section.Key("compare").String()
 	compareItems := make(map[string]bool)
@@ -1010,6 +1025,10 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	if dstSnapshotTS != "" {
 		dstSnapshotTSPtr = &dstSnapshotTS
 	}
+	var maxExecTimePtr *int
+	if maxExecutionTimeMS > 0 {
+		maxExecTimePtr = &maxExecutionTimeMS
+	}
 
 	srcDB, err := d.getConnection(src)
 	if err != nil {
@@ -1025,8 +1044,8 @@ func (d *DBDataDiff) diff(conf *ini.File) string {
 	}
 	defer closeDBWithTimeout(dstDB, "目标库")
 
-	srcPool := newSnapshotConnPool(srcDB, srcSnapshotTSPtr, maxOpenConns)
-	dstPool := newSnapshotConnPool(dstDB, dstSnapshotTSPtr, maxOpenConns)
+	srcPool := newSnapshotConnPool(srcDB, srcSnapshotTSPtr, maxExecTimePtr, maxOpenConns)
+	dstPool := newSnapshotConnPool(dstDB, dstSnapshotTSPtr, maxExecTimePtr, maxOpenConns)
 	defer srcPool.close()
 	defer dstPool.close()
 
